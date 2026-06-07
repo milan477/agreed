@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Env / secrets
+.env
+.env.local
+
+# Local DB
+*.sqlite
+*.sqlite3
+agreed.db
+backend/data/
+
+# Node / Next
+node_modules/
+.pnpm-store/
+.next/
+out/
+.vercel/
+
+# Weave / wandb local
+wandb/
+.weave/
+
+# OS
+.DS_Store

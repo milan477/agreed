@@ -1,0 +1,4 @@
+# pnpm 11 requires explicit build-script approval (allowBuilds).
+# @scarf/scarf is analytics telemetry from a transitive dep — not needed.
+allowBuilds:
+  "@scarf/scarf": false
