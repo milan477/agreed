@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS channel_index (
     updated_at DOUBLE PRECISION
 );
 CREATE INDEX IF NOT EXISTS idx_channel_user ON channel_index(user_id);
+CREATE TABLE IF NOT EXISTS chat_conversations (
+    conversation_id TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    messages        TEXT NOT NULL,
+    created_at      DOUBLE PRECISION,
+    updated_at      DOUBLE PRECISION
+);
+CREATE INDEX IF NOT EXISTS idx_chat_conv_user ON chat_conversations(user_id, updated_at);
 """
 
 POSTGRES_RLS_SQL = """
@@ -66,6 +75,10 @@ CREATE POLICY records_isolation ON records
 ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS audit_log_isolation ON audit_log;
 CREATE POLICY audit_log_isolation ON audit_log
+    USING (user_id = current_setting('agreed.user_id', true));
+ALTER TABLE chat_conversations ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS chat_conversations_isolation ON chat_conversations;
+CREATE POLICY chat_conversations_isolation ON chat_conversations
     USING (user_id = current_setting('agreed.user_id', true));
 """
 

@@ -22,6 +22,14 @@ from ..domain.term_sheets import DIM_LABELS, get_scenario
 from ..evals.evaluations import run_eval_suite
 from ..observability import init_observability, weave_trace_url
 from ..orchestration.graph import NegotiationOrchestrator
+from ..persistence.conversations import (
+    create_conversation,
+    get_conversation,
+    list_conversations,
+    resolve_active_conversation,
+    save_messages,
+    title_from_first_message,
+)
 from ..persistence.store import UserScopedStore, ensure_user, init_db
 from .chat_service import (
     _default_profile,
@@ -69,6 +77,7 @@ from .schemas import (
     UserIn,
 )
 from ..persistence.sessions import get_session, update_session
+from ..memory.store import long_term, short_term
 from .summary import summarize_trace
 
 app = FastAPI(title="agreed", description="better agreements, faster", version="0.1.0")
@@ -253,19 +262,32 @@ def audit(st: UserScopedStore = Depends(store)) -> dict:
     return {"audit_log": st.audit_trail()}
 
 
+def _profile_bundle(st: UserScopedStore) -> tuple[dict | None, dict]:
+    prof_rec = next((r for r in st.list("user_profile")), None)
+    profile = prof_rec["data"] if prof_rec else _default_profile()
+    return prof_rec, profile
+
+
+def _legacy_chat_messages(st: UserScopedStore) -> list[dict]:
+    chat_rec = next((r for r in st.list("chat_history")), None)
+    return chat_rec["data"] if chat_rec else []
+
+
 # ── home: chat + opportunities ────────────────────────────────────────────────
 @app.get("/api/home")
 def home(user_id: str = Depends(current_user), st: UserScopedStore = Depends(store)) -> dict:
-    prof_rec = next((r for r in st.list("user_profile")), None)
-    profile = prof_rec["data"] if prof_rec else _default_profile()
-    chat_rec = next((r for r in st.list("chat_history")), None)
-    history = chat_rec["data"] if chat_rec else []
+    prof_rec, profile = _profile_bundle(st)
+    legacy = _legacy_chat_messages(st)
+    conv = resolve_active_conversation(st.user_id, profile, legacy_messages=legacy)
+    st.put("user_profile", profile, record_id=prof_rec["id"] if prof_rec else None)
     sessions = list_user_sessions(st)
     goals = profile.get("goals", [])
     return {
         "user_id": user_id,
         "profile": profile,
-        "chat_history": history,
+        "chat_history": conv["messages"],
+        "active_conversation_id": conv["conversation_id"],
+        "conversations": list_conversations(st.user_id),
         "goals": goals,
         "sessions": sessions,
         "contacts": list_contacts(st),
@@ -273,20 +295,64 @@ def home(user_id: str = Depends(current_user), st: UserScopedStore = Depends(sto
     }
 
 
+@app.get("/api/conversations")
+def conversations_list(st: UserScopedStore = Depends(store)) -> dict:
+    return {"conversations": list_conversations(st.user_id)}
+
+
+@app.post("/api/conversations")
+def conversations_create(st: UserScopedStore = Depends(store)) -> dict:
+    prof_rec, profile = _profile_bundle(st)
+    conv = create_conversation(st.user_id)
+    profile["active_conversation_id"] = conv["conversation_id"]
+    st.put("user_profile", profile, record_id=prof_rec["id"] if prof_rec else None)
+    return {"conversation": conv}
+
+
+@app.get("/api/conversations/{conversation_id}")
+def conversations_get(conversation_id: str, st: UserScopedStore = Depends(store)) -> dict:
+    conv = get_conversation(st.user_id, conversation_id)
+    if not conv:
+        raise HTTPException(404, "conversation not found")
+    return {"conversation": conv}
+
+
+@app.post("/api/conversations/{conversation_id}/activate")
+def conversations_activate(conversation_id: str, st: UserScopedStore = Depends(store)) -> dict:
+    conv = get_conversation(st.user_id, conversation_id)
+    if not conv:
+        raise HTTPException(404, "conversation not found")
+    prof_rec, profile = _profile_bundle(st)
+    profile["active_conversation_id"] = conversation_id
+    st.put("user_profile", profile, record_id=prof_rec["id"] if prof_rec else None)
+    return {"conversation": conv, "profile": profile}
+
+
 @app.post("/api/chat")
 def chat(body: ChatIn, st: UserScopedStore = Depends(store)) -> dict:
-    prof_rec = next((r for r in st.list("user_profile")), None)
-    profile = prof_rec["data"] if prof_rec else _default_profile()
-    chat_rec = next((r for r in st.list("chat_history")), None)
-    history = body.history if body.history else (chat_rec["data"] if chat_rec else [])
+    prof_rec, profile = _profile_bundle(st)
+    legacy = _legacy_chat_messages(st) if not body.conversation_id else []
+    conv = resolve_active_conversation(
+        st.user_id,
+        profile,
+        conversation_id=body.conversation_id,
+        legacy_messages=legacy,
+    )
+    history = body.history if body.history else conv["messages"]
+    memories = long_term().recall(st.user_id, body.message, limit=5)
+    if memories:
+        profile = {**profile, "recalled_memories": memories}
     result = chat_with_agent(body.message, history, profile)
     history = [*history, {"role": "user", "content": body.message}, {"role": "assistant", "content": result["reply"]}]
-    pid = prof_rec["id"] if prof_rec else None
-    cid = chat_rec["id"] if chat_rec else None
-    st.put("user_profile", result["profile"], record_id=pid)
-    st.put("chat_history", history, record_id=cid)
-    followup = maybe_schedule_followup(st, result["profile"], result)
-    return {**result, "followup_scheduled": followup}
+    title = title_from_first_message(body.message) if not conv["messages"] else None
+    save_messages(st.user_id, conv["conversation_id"], history, title=title)
+    updated_profile = {**result["profile"], "active_conversation_id": conv["conversation_id"]}
+    st.put("user_profile", updated_profile, record_id=prof_rec["id"] if prof_rec else None)
+    if len(body.message.strip()) >= 12:
+        long_term().remember(st.user_id, body.message.strip()[:240], {"source": "chat"})
+    short_term().set(st.user_id, "last_chat", {"message": body.message, "reply": result["reply"]}, ttl=7200)
+    followup = maybe_schedule_followup(st, updated_profile, result)
+    return {**result, "profile": updated_profile, "conversation_id": conv["conversation_id"], "followup_scheduled": followup}
 
 
 @app.post("/api/invitations/join")

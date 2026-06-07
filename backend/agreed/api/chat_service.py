@@ -36,106 +36,165 @@ def _default_profile() -> dict:
     }
 
 
+# Intent leads ("I want to…", "wanna…") and bare action verbs ("buy a car").
+_INTENT_LEAD = re.compile(
+    r"\b(?:i\s+)?(?:want(?:ed)?\s+to|wanna|gonna|need(?:ed)?\s+to|would\s+like\s+to|"
+    r"i'?d\s+like\s+to|looking\s+to|trying\s+to|hoping\s+to|plan(?:ning)?\s+to|"
+    r"we\s+(?:want|need)\s+to)\s+(.+)",
+    re.I,
+)
+_ACTION = re.compile(
+    r"\b(buy|purchase|procure|order|sell|offer|lease|rent|hire|renew|"
+    r"renegotiate|negotiate|acquire|book)\b\s+(.+)",
+    re.I,
+)
+_PARTICIPATION_WORDS = (
+    "participate", "community", "survey", "residents", "municipality", "petition",
+    "town hall", "council", "hoa", "weigh in", "say in", "deliberat", "rezoning",
+)
+
+
+def _detect_kind(text: str, corp: bool) -> str:
+    if corp:
+        return "negotiation"
+    if any(w in text for w in _PARTICIPATION_WORDS):
+        return "participation"
+    return "negotiation"
+
+
+def _clean_title(message: str, kind: str) -> str:
+    """Turn a free-form sentence into a short, clean goal title."""
+    text = re.sub(
+        r"^\s*(yo|hey|hi|hello|ok|okay|so|um|uh|well|please|pls|alright|aight)[\s,!]+",
+        "", message.strip(), flags=re.I,
+    )
+    core = ""
+    m = _INTENT_LEAD.search(text)
+    if m:
+        core = m.group(1)
+    else:
+        m2 = _ACTION.search(text)
+        if m2:
+            core = f"{m2.group(1)} {m2.group(2)}"
+    if not core:
+        core = text
+    # Drop trailing price/constraint clauses so the title stays about the thing.
+    core = re.split(
+        r"\s*(?:,|;|\.|—|\bbudget\b|\bunder\b|\bmax\b|\bfor \$|\bat \$|\baround \$|\bbecause\b|\bso that\b)",
+        core, maxsplit=1, flags=re.I,
+    )[0]
+    core = core.strip(" .!?,")
+    words = core.split()
+    if len(words) > 9:
+        core = " ".join(words[:9])
+    if not core:
+        return "New " + kind
+    return core[0].upper() + core[1:]
+
+
 def _extract_goals(message: str, existing: list[dict], account_type: str = "individual") -> list[dict]:
     """Heuristic goal detection from chat (works offline).
 
-    Corporations only ever negotiate, so every detected goal is a negotiation.
+    A goal is created when the message expresses an actionable intent. Once we
+    already track a goal, only an *explicit* new intent ("I want to…") starts
+    another, so follow-up answers (prices, priorities) don't spawn stray goals.
+    Corporations only ever negotiate.
     """
     corp = account_type == "corporation"
     text = message.lower()
     goals = list(existing)
     titles: set[str] = {g["title"].lower() for g in goals}
 
-    patterns = [
-        (r"\b(buy|purchase|procure|order)\b.+(?:bulk|shirts|software|platform|contract)", "negotiation"),
-        (r"\b(sell|offer|provide)\b", "negotiation"),
-        (r"\b(rent|lease|landlord|tenant)\b", "negotiation"),
-        (r"\b(hire|employ|candidate|salary|contract|deal|supplier|vendor)\b", "negotiation"),
-        (r"\b(participate|community|survey|residents|municipality|petition|town hall)\b", "participation"),
-    ]
-    for pat, kind in patterns:
-        if re.search(pat, text):
-            if corp:
-                kind = "negotiation"
-            title = message.strip()[:80] or ("New " + kind)
-            key = title.lower()
-            if key not in titles:
-                goals.append({
-                    "id": uuid.uuid4().hex[:10],
-                    "title": title,
-                    "kind": kind,
-                    "status": "open",
-                    "created_from_chat": True,
-                })
-                titles.add(key)
-            break
+    has_lead = bool(_INTENT_LEAD.search(text))
+    has_action = bool(_ACTION.search(text)) or any(w in text for w in _PARTICIPATION_WORDS)
+    if not (has_lead or has_action):
+        return goals
+    if existing and not has_lead:
+        return goals
 
-    # Generic "I want to ..." / "I need to ..."
-    m = re.search(r"\b(i want to|i need to|looking to|trying to|we need|we want)\s+(.{8,60})", text)
-    if m and len(goals) == len(existing):
-        title = m.group(2).strip(" .")
-        if title.lower() not in titles:
-            if corp:
-                kind = "negotiation"
-            else:
-                kind = "participation" if ("participate" in text or "community" in text) else "negotiation"
-            goals.append({
-                "id": uuid.uuid4().hex[:10],
-                "title": title[0].upper() + title[1:],
-                "kind": kind,
-                "status": "open",
-                "created_from_chat": True,
-            })
+    kind = _detect_kind(text, corp)
+    title = _clean_title(message, kind)
+    if title.lower() not in titles:
+        goals.append({
+            "id": uuid.uuid4().hex[:10],
+            "title": title,
+            "kind": kind,
+            "status": "open",
+            "created_from_chat": True,
+        })
     return goals
+
+
+_CHAT_SYSTEM = """You are the user's own AI agent on "agreed" — a platform where every party is represented by an AI agent and negotiations happen agent-to-agent. You are an extension of the user, not a separate persona.
+
+HOW AGREED WORKS — follow this strictly:
+- You NEVER search for, find, browse, or source the other party or the item (a seller, buyer, vendor, landlord, a specific car, etc.). The platform does not go shopping for the user.
+- A negotiation starts only when an "agreed?" session is created and the user shares an agreement link with the other party. That party opens the link, their own agent joins, and the two agents negotiate to an agreement.
+- Your job in this chat: (1) understand the user's objective in THEIR voice, (2) probe their preferences/targets, (3) once you have enough, tell them you're setting up an "agreed?" session that they can share a link from to bring in the other party. Never offer to find or contact the counterparty yourself.
+
+VOICE: Mirror the user's tone, register, slang, punctuation and energy exactly (if they say "yo bro", you match that). Keep replies to 1-2 sentences. Acknowledge what they just told you, then ask only for the NEXT missing piece — never re-ask something already answered.
+
+WHAT TO COLLECT:
+- negotiation: ideal/target price, walk-away (hard limit), and what matters most (priorities).
+- participation: the user's stance and the specific points to push for.
+
+OUTPUT — respond with ONLY a JSON object, no prose:
+{
+  "reply": "your next message, in the user's voice",
+  "goal": {"title": "short clean objective like 'Buy a used car'", "kind": "negotiation" or "participation"} or null,
+  "intake": {"target": number or null, "walk_away": number or null, "priorities": ["..."], "counterparty": "name only if the user named one, else null"},
+  "ready": true or false,
+  "suggested": ["up to 3 short FIRST-PERSON quick replies the user could tap; a fill-in template may end with the … character"]
+}
+
+RULES:
+- Reuse the Current goal's exact title unless the user clearly switches objective; set "goal" to null when the objective is unchanged.
+- "intake" MUST merge with what's already collected (echo known values back, add new ones).
+- "ready" is true only when there is enough to set up the session — negotiation: target AND walk-away AND at least one priority; participation: a clear stance.
+- When "ready" is true, "reply" must say you're setting up their agreed? session and they'll get a link to send the other party. Do NOT say you'll find, search, or contact anyone.
+- For a corporation account, "kind" is always "negotiation"."""
 
 
 @op(name="chat.represent", kind="agent")
 def chat_with_agent(message: str, history: list[dict], profile: dict) -> dict:
     account_type = profile.get("account_type", "individual")
-    old_ids = {g["id"] for g in profile.get("goals", [])}
-    goals = _extract_goals(message, profile.get("goals", []), account_type)
-    new_goals = [g for g in goals if g["id"] not in old_ids]
+    goals: list[dict] = list(profile.get("goals", []))
     profile = {**profile, "goals": goals}
 
-    # Update constraints/style from message
-    if any(w in message.lower() for w in ("budget", "under $", "max ", "timeline", "deadline")):
-        profile["constraints"] = (profile.get("constraints", "") + " " + message).strip()[:300]
     if "aggressive" in message.lower():
         profile["style"] = "assertive"
     elif "relationship" in message.lower() or "preserve" in message.lower():
         profile["style"] = "relationship-preserving"
-
-    # Keep a sample of how the user talks so the agent can mirror their voice
-    # everywhere — in chat and later when it negotiates on their behalf.
     if len(message.strip()) >= 6:
         profile["voice_sample"] = message.strip()[:240]
 
-    system = (
-        "You are the user's own agent on agreed — an extension of them, not a separate persona. "
-        "Mirror their voice precisely: match their tone, register, slang, punctuation and energy. "
-        "If they write 'hey bro, need to sort a deal', you reply in that same casual register; if "
-        "they're formal, you're formal. Learn who they are and what they want, acknowledge any goal "
-        "they mention, and ask ONE focused follow-up about their targets, priorities or constraints. "
-        "Never inject your own opinions or agenda. Keep it to 1-3 sentences."
-    )
-    hist = "\n".join(f"{m['role']}: {m['content']}" for m in history[-8:])
-    reply = chat_text(
-        system,
-        f"User profile so far: {profile}\nAccount type: {account_type}\n\n"
-        f"Conversation:\n{hist}\n\nUser: {message}\n\nReply in the user's own voice:",
-        temperature=0.7,
-    )
-    if not reply:
-        reply = _mirrored_fallback(message, goals, profile, account_type)
+    active_before = goals[-1] if goals else None
 
-    if len(message) > 20 and not profile.get("intent_summary"):
+    # LLM-first: a single structured turn does the text processing (understand,
+    # probe, extract intake, decide readiness). Heuristics are only a fallback.
+    data = _llm_turn(message, history, profile, account_type, active_before)
+
+    if isinstance(data, dict) and data.get("reply"):
+        reply, active_goal, new_goals, ready, suggested = _apply_llm_turn(data, goals, account_type)
+    else:
+        old_ids = {g["id"] for g in goals}
+        goals[:] = _extract_goals(message, list(goals), account_type)
+        new_goals = [g for g in goals if g["id"] not in old_ids]
+        active_goal = goals[-1] if goals else None
+        changed = _update_intake(message, active_goal) if active_goal is not None else []
+        reply = _statemachine_reply(message, active_goal, account_type, changed, bool(new_goals))
+        ready = _is_ready(active_goal)
+        suggested = _suggested_questions(active_goal, account_type)
+
+    _sync_constraints(profile, active_goal)
+    if len(message) > 16 and not profile.get("intent_summary"):
         profile["intent_summary"] = message[:280]
+    profile["goals"] = goals
 
-    intent = _validate_intent(message, new_goals, goals, account_type)
-    suggested = _suggested_questions(message, profile, new_goals, account_type)
+    intent = _intent_for(active_goal, ready)
 
     return {
-        "reply": reply.strip(),
+        "reply": (reply or "").strip(),
         "profile": profile,
         "new_goals": new_goals,
         "intent": intent,
@@ -143,59 +202,355 @@ def chat_with_agent(message: str, history: list[dict], profile: dict) -> dict:
     }
 
 
-def _validate_intent(message: str, new_goals: list[dict], goals: list[dict], account_type: str) -> dict:
-    """Surface a confirmable intent so the chat can validate before acting.
+def _llm_turn(
+    message: str, history: list[dict], profile: dict, account_type: str, active: dict | None
+) -> dict | None:
+    cur_goal = {"title": active["title"], "kind": active.get("kind")} if active else None
+    intake = (active or {}).get("intake", {})
+    system = _CHAT_SYSTEM
+    recalled = profile.get("recalled_memories") or []
+    if recalled:
+        system += f"\n\nRecalled preferences about this user (use them): {recalled[:3]}"
+    hist = "\n".join(f"{m['role']}: {m['content']}" for m in history[-10:])
+    audience = (
+        "corporations only ever negotiate" if account_type == "corporation"
+        else "individuals can negotiate or participate"
+    )
+    user = (
+        f"Account type: {account_type} ({audience}).\n"
+        f"Current goal: {cur_goal}\n"
+        f"Collected intake so far: {intake}\n"
+        f"Recent conversation:\n{hist or '(none yet)'}\n"
+        f"Latest user message: {message}\n\n"
+        "Return the JSON now."
+    )
+    return chat_json(system, user, temperature=0.6, max_tokens=400)
 
-    CopilotKit renders this as an inline confirmation card; offline we still
-    detect intent heuristically so the UX is identical.
-    """
-    if new_goals:
-        g = new_goals[-1]
+
+def _coerce_num(v: Any) -> int | None:
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    s = str(v).strip().lower().replace(",", "").replace("$", "").replace("usd", "").strip()
+    if not s:
+        return None
+    mult = 1
+    if s.endswith("k"):
+        mult, s = 1000, s[:-1].strip()
+    try:
+        return int(round(float(s) * mult))
+    except Exception:
+        return None
+
+
+def _apply_llm_turn(
+    data: dict, goals: list[dict], account_type: str
+) -> tuple[str, dict | None, list[dict], bool, list[str]]:
+    """Apply the LLM's structured turn to the goal list and intake."""
+    old_ids = {g["id"] for g in goals}
+    active = goals[-1] if goals else None
+
+    g = data.get("goal")
+    if isinstance(g, dict) and g.get("title"):
+        title = str(g["title"]).strip()[:80]
+        kind = g.get("kind") if g.get("kind") in ("negotiation", "participation") else "negotiation"
+        if account_type == "corporation":
+            kind = "negotiation"
+        match = next((ex for ex in goals if ex["title"].strip().lower() == title.lower()), None)
+        if match is None:
+            active = {
+                "id": uuid.uuid4().hex[:10],
+                "title": title[0].upper() + title[1:],
+                "kind": kind,
+                "status": "open",
+                "created_from_chat": True,
+            }
+            goals.append(active)
+        else:
+            active = match
+            active["kind"] = kind
+
+    if active is not None:
+        intake = active.setdefault(
+            "intake", {"target": None, "walk_away": None, "priorities": [], "counterparty": None}
+        )
+        src = data.get("intake") or {}
+        t, w = _coerce_num(src.get("target")), _coerce_num(src.get("walk_away"))
+        if t is not None:
+            intake["target"] = t
+        if w is not None:
+            intake["walk_away"] = w
+        for p in src.get("priorities") or []:
+            p = str(p).strip()
+            if p and p.lower() not in [x.lower() for x in intake["priorities"]]:
+                intake["priorities"].append(p)
+        cp = src.get("counterparty")
+        if cp and str(cp).strip().lower() not in ("", "null", "none", "unknown"):
+            intake["counterparty"] = str(cp).strip()
+        if (
+            active.get("kind") == "negotiation"
+            and intake["target"] and intake["walk_away"]
+            and intake["target"] > intake["walk_away"]
+        ):
+            intake["target"], intake["walk_away"] = intake["walk_away"], intake["target"]
+
+    new_goals = [g2 for g2 in goals if g2["id"] not in old_ids]
+    reply = str(data.get("reply") or "")
+    ready = bool(data.get("ready"))
+    suggested = [str(s).strip() for s in (data.get("suggested") or []) if str(s).strip()][:3]
+    if not suggested:
+        suggested = _suggested_questions(active, account_type)
+    return reply, active, new_goals, ready, suggested
+
+
+def _intent_for(active: dict | None, ready: bool) -> dict:
+    if active and ready:
         return {
             "detected": True,
-            "summary": g["title"],
-            "kind": g["kind"],
-            "goal_id": g["id"],
-            "confidence": 0.82,
+            "summary": active["title"],
+            "kind": active.get("kind", "negotiation"),
+            "goal_id": active["id"],
+            "confidence": 0.92,
             "needs_confirmation": True,
-            "prompt": f"Want me to set up “{g['title']}” as a {g['kind']}?",
+            "prompt": f"Set up your agreed? session for “{active['title']}” so you can share a link with the other party?",
         }
     return {"detected": False}
 
 
-def _suggested_questions(message: str, profile: dict, new_goals: list[dict], account_type: str) -> list[str]:
-    """Dynamically propose the next useful things to tell the agent."""
-    if llm_available_safe():
-        sys = (
-            "You generate up to 3 very short follow-up prompts (max 7 words each) that the USER could "
-            "tap to tell their negotiation agent more. Return JSON: {\"questions\": [\"...\"]}. "
-            "Base them on what's still unknown (targets, walk-away, counterparty, deadline, priorities)."
+# ── Conversational intake state machine ──────────────────────────────────────
+# Drives a real, progressing conversation even with no LLM key. Each turn we
+# parse what the user said into the active goal's `intake`, acknowledge it, then
+# ask for the next thing we still need.
+
+_WALK_WORDS = (
+    "max ", "maximum", "cap", "ceiling", "no more than", "most i", "most i'd",
+    "walk away", "walk-away", "up to", "at most", "hard limit", "limit",
+)
+_TARGET_WORDS = (
+    "under", "below", "around", "ideally", "target", "aim", "want to pay",
+    "budget", "about", "roughly", "prefer", "hoping", "looking to spend",
+)
+_PRIORITY_WORDS = {
+    "price": ("price", "cost", "cheap", "cheapest", "money", "affordable", "value", "lowest"),
+    "quality": ("quality", "condition", "reliable", "reliability", "durable", "build"),
+    "brand": ("brand", "iphone", "apple", "samsung", "pixel", "android", "model"),
+    "delivery": ("delivery", "shipping", "fast", "quick", "speed", "timeline", "deadline", "soon"),
+    "warranty": ("warranty", "guarantee", "return", "returns"),
+    "quantity": ("quantity", "units", "bulk", "volume", "pieces"),
+    "battery": ("battery",),
+    "support": ("support", "service"),
+}
+
+
+def _extract_amounts(text: str) -> list[int]:
+    out: list[int] = []
+    for m in re.finditer(r"\$?\s*(\d[\d,]*(?:\.\d+)?)\s*(k\b)?(?!\s*%)", text.lower()):
+        raw = m.group(1).replace(",", "")
+        try:
+            val = float(raw)
+        except ValueError:
+            continue
+        if m.group(2):
+            val *= 1000
+        out.append(int(round(val)))
+    return out
+
+
+def _update_intake(message: str, goal: dict) -> list[tuple[str, Any]]:
+    text = message.lower()
+    intake = goal.setdefault(
+        "intake", {"target": None, "walk_away": None, "priorities": [], "counterparty": None}
+    )
+    changed: list[tuple[str, Any]] = []
+
+    if goal.get("kind") == "negotiation":
+        has_currency = any(c in text for c in ("$", "usd", "dollar", "eur", "€"))
+        amounts = [a for a in _extract_amounts(text) if a >= 50 or has_currency]
+        is_walk = any(w in text for w in _WALK_WORDS)
+        is_target = any(w in text for w in _TARGET_WORDS)
+        for a in amounts:
+            if is_walk and intake["walk_away"] is None:
+                intake["walk_away"] = a
+                changed.append(("walk", a))
+            elif is_target and intake["target"] is None:
+                intake["target"] = a
+                changed.append(("target", a))
+            elif intake["target"] is None:
+                intake["target"] = a
+                changed.append(("target", a))
+            elif intake["walk_away"] is None:
+                intake["walk_away"] = a
+                changed.append(("walk", a))
+        if intake["target"] and intake["walk_away"] and intake["target"] > intake["walk_away"]:
+            intake["target"], intake["walk_away"] = intake["walk_away"], intake["target"]
+
+    for dim, kws in _PRIORITY_WORDS.items():
+        if any(k in text for k in kws) and dim not in intake["priorities"]:
+            intake["priorities"].append(dim)
+            changed.append(("priority", dim))
+
+    if intake.get("counterparty") is None:
+        if any(p in text for p in (
+            "find me", "find a", "you find", "source one", "source a", "pick one",
+            "whoever", "anyone", "you choose", "you decide", "up to you",
+        )):
+            intake["counterparty"] = "(agent will source)"
+            changed.append(("cp", "find"))
+        else:
+            m = re.search(r"\b(?:from|with|at|against)\s+([A-Za-z][\w&'’\-. ]{2,40})", message)
+            if m:
+                cp = m.group(1).strip().rstrip(".")
+                intake["counterparty"] = cp
+                changed.append(("cp", cp))
+    return changed
+
+
+def _intake_summary(goal: dict | None) -> str:
+    if not goal:
+        return "nothing yet — still learning what they want"
+    it = goal.get("intake", {})
+    parts = [f"goal: {goal['title']} ({goal.get('kind', 'negotiation')})"]
+    if it.get("target"):
+        parts.append(f"target ${it['target']:,}")
+    if it.get("walk_away"):
+        parts.append(f"walk-away ${it['walk_away']:,}")
+    if it.get("priorities"):
+        parts.append("priorities: " + ", ".join(it["priorities"]))
+    if it.get("counterparty"):
+        parts.append(f"counterparty: {it['counterparty']}")
+    return "; ".join(parts)
+
+
+def _sync_constraints(profile: dict, goal: dict | None) -> None:
+    if not goal or goal.get("kind") != "negotiation":
+        return
+    it = goal.get("intake", {})
+    parts = []
+    if it.get("target"):
+        parts.append(f"target ${it['target']:,}")
+    if it.get("walk_away"):
+        parts.append(f"walk-away ${it['walk_away']:,}")
+    if it.get("priorities"):
+        parts.append("priorities: " + ", ".join(it["priorities"]))
+    if parts:
+        profile["constraints"] = ("; ".join(parts))[:300]
+
+
+def _ack_text(changed: list[tuple[str, Any]], casual: bool) -> str:
+    if not changed:
+        return ""
+    bits = []
+    for kind, val in changed:
+        if kind == "target":
+            bits.append(f"target ~${val:,}")
+        elif kind == "walk":
+            bits.append(f"ceiling ${val:,}")
+        elif kind == "priority":
+            bits.append(f"{val} matters")
+        elif kind == "cp":
+            bits.append("you'll share a link with them" if val == "find" else f"counterparty {val}")
+    if not bits:
+        return ""
+    lead = "Bet" if casual else "Got it"
+    return f"{lead} — {', '.join(bits)}. "
+
+
+def _ask_goal(account_type: str, casual: bool) -> str:
+    if account_type == "corporation":
+        return (
+            "What deal we trying to close? Give me the gist." if casual
+            else "What deal are you trying to get done? Give me the gist and what matters most."
         )
-        usr = f"Account: {account_type}. Profile: {profile}. Latest message: {message}."
-        data = chat_json(sys, usr, max_tokens=160)
-        if data and isinstance(data.get("questions"), list):
-            qs = [str(q).strip() for q in data["questions"] if str(q).strip()][:3]
-            if qs:
-                return qs
-    have_goal = bool(profile.get("goals"))
-    constraints = profile.get("constraints", "")
-    out: list[str] = []
-    if new_goals or have_goal:
-        if "budget" not in constraints.lower() and "$" not in constraints:
-            out.append("Set my budget / walk-away")
-        out.append("Who's on the other side?")
-        out.append("What matters most to me")
-    else:
-        out = ["I want to negotiate a deal", "I want a say in a decision", "Learn about me first"]
-    return out[:3]
+    return (
+        "What're we doing — buying, selling, leasing, or weighing in on something? Talk to me." if casual
+        else "What are you trying to get done — something to buy, sell, lease, or weigh in on? Say it however you'd say it."
+    )
 
 
-def llm_available_safe() -> bool:
-    try:
-        from ..llm import llm_available
-        return llm_available()
-    except Exception:
+def _is_ready(goal: dict | None) -> bool:
+    if not goal:
         return False
+    it = goal.get("intake", {})
+    if goal.get("kind") == "participation":
+        return bool(it.get("priorities"))
+    return it.get("target") is not None and it.get("walk_away") is not None and bool(it.get("priorities"))
+
+
+def _statemachine_reply(
+    message: str, goal: dict | None, account_type: str, changed: list[tuple[str, Any]], is_new: bool
+) -> str:
+    casual = _detect_register(message) == "casual"
+    if goal is None:
+        return _ask_goal(account_type, casual)
+
+    kind = goal.get("kind", "negotiation")
+    it = goal.get("intake", {})
+    ack = _ack_text(changed, casual)
+    if is_new:
+        opener = f'Aight, "{goal["title"]}". ' if casual else f'On it — "{goal["title"]}". '
+        ack = opener + ack
+    nothing_parsed = (not changed) and (not is_new)
+
+    if kind == "participation":
+        if not it.get("priorities"):
+            q = "where do you stand — what points should I push for?"
+        else:
+            tail = (
+                "i'll spin up your agreed? session so you can share a link and bring the other side in."
+                if casual else
+                "I'll set up your agreed? session — share the link to bring the other side in."
+            )
+            return (ack + f"Got your position. {tail[0].upper() + tail[1:]}").strip()
+    else:
+        t, w, pr = it.get("target"), it.get("walk_away"), it.get("priorities")
+        if t is None and w is None:
+            q = "what's your ideal price, and the most you'd pay?"
+        elif w is None:
+            q = "what's the most you'd pay — your walk-away?"
+        elif t is None:
+            q = "what price are you hoping for?"
+        elif not pr:
+            q = "besides price, what matters — brand, condition, delivery, quantity?"
+        else:
+            tail = (
+                "i'll spin up your agreed? session — you just send the link to the seller to kick it off."
+                if casual else
+                "I'll set up your agreed? session — share the link with the seller to start the negotiation."
+            )
+            return (ack + f"That's what I needed. {tail[0].upper() + tail[1:]}").strip()
+
+    q = q[0].upper() + q[1:]
+    if nothing_parsed:
+        lead = "Hmm, missed that — " if casual else "Didn't quite catch that — "
+        return (lead + q[0].lower() + q[1:]).strip()
+    return (ack + q).strip()
+
+
+def _suggested_questions(goal: dict | None, account_type: str) -> list[str]:
+    """Concrete, first-person quick replies for the next step (tap to prefill)."""
+    if goal is None:
+        if account_type == "corporation":
+            return ["We need a supply contract", "Renew a vendor deal", "Hire a contractor"]
+        return ["I want to buy something", "I want to sell something", "I want a say in a decision"]
+
+    kind = goal.get("kind", "negotiation")
+    it = goal.get("intake", {})
+    if kind == "participation":
+        if not it.get("priorities"):
+            return ["My main concern is…", "I care most about…", "I'd compromise on…"]
+        return ["Set it up", "Add a tentative point", "Let me add another stance"]
+
+    t, w, pr = it.get("target"), it.get("walk_away"), it.get("priorities")
+    if t is None and w is None:
+        return ["My budget is around $…", "Most I'd pay is $…", "I'm hoping for $…"]
+    if w is None:
+        return ["Most I'd pay is $…", "My hard limit is $…"]
+    if t is None:
+        return ["I'm hoping for around $…"]
+    if not pr:
+        return ["Price matters most", "Condition & brand matter", "Just the lowest price"]
+    return ["Set up the agreed? session", "Add another priority"]
 
 
 def connect_source(source_id: str, st: UserScopedStore) -> dict:
@@ -250,25 +605,6 @@ def _detect_register(message: str) -> str:
     t = message.lower()
     casual = any(w in t for w in ("bro", "dude", "hey", "yo", "gonna", "wanna", "lol", "tbh", "sup", "y'all"))
     return "casual" if casual else "neutral"
-
-
-def _mirrored_fallback(message: str, goals: list[dict], profile: dict, account_type: str) -> str:
-    register = _detect_register(message)
-    casual = register == "casual"
-    has_new_goal = goals and goals[-1]["id"] not in {g.get("id") for g in profile.get("goals", [])[:-1]}
-    if has_new_goal:
-        g = goals[-1]
-        if casual:
-            return f"Got it bro — locking in \"{g['title']}\". What's your dream outcome here, and where's your hard line?"
-        return f"Noted: \"{g['title']}\". What matters most to you there, and what would make you walk away?"
-    if not profile.get("intent_summary"):
-        if account_type == "corporation":
-            return ("Tell me what deal you're trying to get done and I'll handle it."
-                    if not casual else "Aight — what deal are we trying to close? I got you.")
-        return ("Tell me what you're trying to get done — a deal to negotiate or something you want a say in — and I'll take it from there."
-                if not casual else "What're we trying to do? A deal to negotiate or something you wanna weigh in on? I'm on it.")
-    return ("Got it. Anything else I should know about your targets or limits before I get to work?"
-            if not casual else "Cool. Anything else I should know before I jump on this?")
 
 
 def new_session_from_goal(user_id: str, goal: dict, st: UserScopedStore) -> dict:

@@ -137,13 +137,24 @@ def op(name: str | None = None, kind: str = "function") -> Callable:
                 _tracer.add(trace_id, span)
                 _current_span.reset(token)
 
-        # Layer Weave's own op on top when available so it shows in the hosted UI.
-        if _weave is not None:
-            try:
-                return _weave.op(name=span_name)(wrapper)  # type: ignore[attr-defined]
-            except Exception:
-                return wrapper
-        return wrapper
+        _weave_wrapped: Callable | None = None
+
+        @functools.wraps(func)
+        def outer(*args: Any, **kwargs: Any) -> Any:
+            """Apply Weave @op at runtime (after weave.init on startup)."""
+            nonlocal _weave_wrapped
+            global _weave
+            if _weave is None:
+                init_observability()
+            if _weave is not None and _weave_wrapped is None:
+                try:
+                    _weave_wrapped = _weave.op(name=span_name)(wrapper)  # type: ignore[attr-defined]
+                except Exception:
+                    _weave_wrapped = wrapper
+            target = _weave_wrapped or wrapper
+            return target(*args, **kwargs)
+
+        return outer
 
     return decorator
 

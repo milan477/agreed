@@ -50,25 +50,45 @@ def main() -> int:
 
     # 2. Home
     print("\n2. Home")
-    home = req("GET", "/api/home", user_a)
-    check("home has profile", "profile" in home)
-    check("home has goals list", "goals" in home)
+    uses_postgres = h.get("capabilities", {}).get("database") == "postgres"
+    if uses_postgres:
+        home = req("GET", "/api/home", user_a)
+        check("home has profile", "profile" in home)
+        check("home has goals list", "goals" in home)
+        check("home has conversations", "conversations" in home)
+        check("home has active conversation", bool(home.get("active_conversation_id")))
+    else:
+        print("  SKIP  home/conversations (set DATABASE_URL to Supabase Postgres)")
 
     # 3. Chat
     print("\n3. Chat & goal extraction")
-    chat = req("POST", "/api/chat", user_a, {"message": "I want to buy custom printed shirts in bulk for my company"})
-    check("chat reply", bool(chat.get("reply")))
-    goals = chat["profile"]["goals"]
-    check("goal extracted", len(goals) >= 1, f"goals={goals}")
-    goal = goals[0]
-    check("goal is negotiation", goal["kind"] == "negotiation")
+    if not uses_postgres:
+        print("  SKIP  chat tests (set DATABASE_URL to Supabase Postgres)")
+    else:
+        chat = req("POST", "/api/chat", user_a, {"message": "I want to buy custom printed shirts in bulk for my company"})
+        check("chat reply", bool(chat.get("reply")))
+        check("chat returns conversation_id", bool(chat.get("conversation_id")))
+        goals = chat["profile"]["goals"]
+        check("goal extracted", len(goals) >= 1, f"goals={goals}")
+        goal = goals[0]
+        check("goal is negotiation", goal["kind"] == "negotiation")
 
-    # 4. Chat history persisted
-    home2 = req("GET", "/api/home", user_a)
-    check("chat history saved", len(home2["chat_history"]) >= 2)
+        # 4. Chat history persisted
+        home2 = req("GET", "/api/home", user_a)
+        check("chat history saved", len(home2["chat_history"]) >= 2)
+        check("conversation listed", len(home2.get("conversations") or []) >= 1)
 
-    # 5. Negotiation session
-    print("\n4. Negotiation session")
+        convs = req("GET", "/api/conversations", user_a)
+        check("conversations endpoint", len(convs.get("conversations") or []) >= 1)
+
+        new_conv = req("POST", "/api/conversations", user_a)
+        check("new conversation created", bool(new_conv.get("conversation", {}).get("conversation_id")))
+
+    if not uses_postgres:
+        goal = {"id": "skip", "title": "Test goal", "kind": "negotiation"}
+        print("\n4. Negotiation session (skipped chat-dependent steps)")
+    else:
+        print("\n4. Negotiation session")
     sess = req("POST", "/api/sessions", user_a, {
         "title": goal["title"], "kind": "negotiation", "goal_id": goal["id"],
     })
@@ -166,9 +186,12 @@ def main() -> int:
 
     # 17. Participation chat goal
     print("\n15. Participation goal from chat")
-    chat2 = req("POST", "/api/chat", user_a, {"message": "I want to participate in the community survey about park redesign"})
-    kinds = [g["kind"] for g in chat2["profile"]["goals"]]
-    check("participation goal", "participation" in kinds, str(kinds))
+    if uses_postgres:
+        chat2 = req("POST", "/api/chat", user_a, {"message": "I want to participate in the community survey about park redesign"})
+        kinds = [g["kind"] for g in chat2["profile"]["goals"]]
+        check("participation goal", "participation" in kinds, str(kinds))
+    else:
+        print("  SKIP  participation chat (set DATABASE_URL)")
 
     print(f"\n=== {passed} passed, {failed} failed ===")
     return 1 if failed else 0

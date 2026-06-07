@@ -120,23 +120,10 @@ def _calendar() -> LearnResult:
     )
 
 
-def _contacts() -> LearnResult:
-    people = random.sample(
-        ["Alex Rivera", "Jordan Kim", "Sam Patel", "Taylor Brooks", "Morgan Lee"],
-        k=3,
-    )
-    return LearnResult(
-        facts=[{"summary": f"Frequent contact: {p}", "detail": "You message them often — likely a counterparty or ally."} for p in people],
-        counterparties=people,
-        agent_line=f"Pulled in your contacts — I can reach {people[0]} or {people[1]} by text the moment we need to.",
-    )
-
-
 REGISTRY: dict[str, Connector] = {
     "gmail": Connector("gmail", "Mailbox", "email", "✉", "Scan recent threads for live negotiations and context.", _gmail),
     "notion": Connector("notion", "Notion", "notion", "◆", "Learn your priorities, budgets and constraints from your notes.", _notion),
     "gcal": Connector("gcal", "Calendar", "calendar", "▦", "Spot deadlines and negotiation touchpoints.", _calendar),
-    "contacts": Connector("contacts", "Contacts", "contacts", "☎", "Know who to reach — and let your agent text them.", _contacts),
 }
 
 

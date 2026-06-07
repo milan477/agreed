@@ -5,6 +5,11 @@ from __future__ import annotations
 import html
 import re
 
+from ..persistence.conversations import (
+    resolve_active_conversation,
+    save_messages,
+    title_from_first_message,
+)
 from ..persistence.store import UserScopedStore
 from .phone_registry import lookup_user
 
@@ -15,8 +20,23 @@ def _load_profile(st: UserScopedStore):
     prof_rec = next((r for r in st.list("user_profile")), None)
     profile = prof_rec["data"] if prof_rec else _default_profile()
     chat_rec = next((r for r in st.list("chat_history")), None)
-    history = chat_rec["data"] if chat_rec else []
-    return prof_rec, chat_rec, profile, history, chat_with_agent
+    legacy = chat_rec["data"] if chat_rec else []
+    conv = resolve_active_conversation(st.user_id, profile, legacy_messages=legacy)
+    history = conv["messages"]
+    return prof_rec, profile, history, conv, chat_with_agent
+
+
+def _persist_turn(st, prof_rec, profile, conv, history, result, message):
+    history = [
+        *history,
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": result["reply"]},
+    ]
+    title = title_from_first_message(message) if not conv["messages"] else None
+    save_messages(st.user_id, conv["conversation_id"], history, title=title)
+    updated = {**result["profile"], "active_conversation_id": conv["conversation_id"]}
+    st.put("user_profile", updated, record_id=prof_rec["id"] if prof_rec else None)
+    return result
 
 
 def handle_inbound_sms(from_phone: str, body: str) -> str:
@@ -26,16 +46,10 @@ def handle_inbound_sms(from_phone: str, body: str) -> str:
         return "Thanks for texting agreed — set up your phone in the web app first so I know it's you."
 
     st = UserScopedStore(user_id)
-    prof_rec, chat_rec, profile, history, chat_with_agent = _load_profile(st)
+    prof_rec, profile, history, conv, chat_with_agent = _load_profile(st)
     message = (body or "").strip() or "Hey"
     result = chat_with_agent(message, history, profile)
-    history = [
-        *history,
-        {"role": "user", "content": message},
-        {"role": "assistant", "content": result["reply"]},
-    ]
-    st.put("user_profile", result["profile"], record_id=prof_rec["id"] if prof_rec else None)
-    st.put("chat_history", history, record_id=chat_rec["id"] if chat_rec else None)
+    result = _persist_turn(st, prof_rec, profile, conv, history, result, message)
 
     from .followups import maybe_schedule_followup
 
@@ -46,16 +60,10 @@ def handle_inbound_sms(from_phone: str, body: str) -> str:
 def handle_voice_turn(user_id: str, speech: str) -> str:
     """Process a speech turn on a Twilio call; returns spoken reply text."""
     st = UserScopedStore(user_id)
-    prof_rec, chat_rec, profile, history, chat_with_agent = _load_profile(st)
+    prof_rec, profile, history, conv, chat_with_agent = _load_profile(st)
     message = (speech or "").strip() or "I'm listening."
     result = chat_with_agent(message, history, profile)
-    history = [
-        *history,
-        {"role": "user", "content": message},
-        {"role": "assistant", "content": result["reply"]},
-    ]
-    st.put("user_profile", result["profile"], record_id=prof_rec["id"] if prof_rec else None)
-    st.put("chat_history", history, record_id=chat_rec["id"] if chat_rec else None)
+    result = _persist_turn(st, prof_rec, profile, conv, history, result, message)
     reply = result["reply"].strip()
     reply = re.sub(r"\s+", " ", reply)
     return reply[:500] if reply else "Got it. Anything else I should know?"

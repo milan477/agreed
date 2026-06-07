@@ -53,16 +53,43 @@ class SelfImprovementAgent(Agent):
         }
 
     def _read_via_mcp(self, trace_id: str | None) -> dict | None:
-        """Query the W&B MCP server for trace analytics. Returns None on failure."""
+        """Summarize recent W&B project activity (MCP-compatible trace read path)."""
+        s = get_settings()
+        if not s.has_wandb:
+            return None
         try:
-            # The W&B MCP server is normally reached by the agent runtime over MCP.
-            # Here we degrade gracefully: if the python wandb client can reach the
-            # project we summarize it, otherwise fall back to the local tracer.
-            import wandb  # type: ignore  # noqa: F401
+            import wandb  # type: ignore
 
-            return None  # placeholder: real MCP query happens via the agent's MCP tool
+            api = wandb.Api(api_key=s.wandb_api_key)
+            project = f"{s.wandb_entity}/{s.weave_project}" if s.wandb_entity else s.weave_project
+            runs = list(api.runs(project, per_page=5))
+            summaries = [
+                {
+                    "name": r.name,
+                    "state": r.state,
+                    "created_at": str(r.created_at),
+                    "summary": dict(r.summary),
+                }
+                for r in runs[:5]
+            ]
+            return {
+                "source": "wandb_api",
+                "trace_id": trace_id,
+                "project": project,
+                "recent_runs": summaries,
+                "diagnosis": self._diagnose_from_runs(summaries),
+                "mcp_note": "Compatible with W&B MCP server at https://mcp.withwandb.com/mcp for deeper trace queries.",
+            }
         except Exception:
             return None
+
+    def _diagnose_from_runs(self, runs: list[dict]) -> list[str]:
+        if not runs:
+            return ["No W&B runs yet; optimizing from self-play priors."]
+        notes = [f"Inspected {len(runs)} recent W&B runs in project."]
+        if any(r.get("state") == "failed" for r in runs):
+            notes.append("Some runs failed; tightening acceptance thresholds.")
+        return notes
 
     def _diagnose(self, spans: list[dict]) -> list[str]:
         notes = []

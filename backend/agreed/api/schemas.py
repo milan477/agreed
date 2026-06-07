@@ -59,6 +59,7 @@ class SignIn(BaseModel):
 class ChatIn(BaseModel):
     message: str
     history: list[dict[str, str]] = []
+    conversation_id: str | None = None
 
 
 class JoinInviteIn(BaseModel):
