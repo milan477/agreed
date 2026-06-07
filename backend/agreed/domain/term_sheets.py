@@ -140,13 +140,17 @@ def _num(value, fallback: float) -> float:
         return float(fallback)
 
 
-def build_dynamic_scenario(targets: dict, title: str = "Custom agreement") -> Scenario:
+def build_dynamic_scenario(
+    targets: dict,
+    title: str = "Custom agreement",
+    counterparty: dict | None = None,
+) -> Scenario:
     """Build a two-party scenario from the user's *own* probed targets.
 
     `targets` maps each dimension to {"target", "walk_away", "importance"}.
-    The user is modelled as the Buyer; a counterparty (Seller) term sheet is
-    derived so that a zone of possible agreement always exists. Nothing is
-    hardcoded — the numbers come from what the user told their agent.
+    The user is modelled as the Buyer. When available, the counterparty term
+    sheet is inferred upstream by the LLM; otherwise a conservative fallback is
+    derived so that a zone of possible agreement exists.
     """
     defaults = BUYER_TERM_SHEET["limits"]
     buyer_limits: dict = {}
@@ -164,16 +168,7 @@ def build_dynamic_scenario(targets: dict, title: str = "Custom agreement") -> Sc
     buyer_limits["payment_terms"] = {"acceptable": PAYMENT_ORDER, "target": buyer_pay_target}
     importances["payment_terms"] = max(1.0, _num(pay.get("importance"), 3.0))
 
-    # Derive the counterparty so a deal is always reachable (ZOPA guaranteed).
-    seller_limits: dict = {}
-    for dim, direction in BUYER_DIRECTION.items():
-        bt = buyer_limits[dim]["target"]
-        bw = buyer_limits[dim]["walk_away"]
-        if direction == "low":  # buyer wants low, counterparty wants high
-            seller_limits[dim] = {"target": _round_dim(dim, bw), "walk_away": _round_dim(dim, bt * 0.9)}
-        else:  # buyer wants high, counterparty wants low
-            seller_limits[dim] = {"target": _round_dim(dim, bw), "walk_away": _round_dim(dim, bt * 1.1)}
-    seller_limits["payment_terms"] = {"acceptable": PAYMENT_ORDER, "target": "net30"}
+    seller_limits = _counterparty_limits(counterparty, buyer_limits)
 
     total_imp = sum(importances.values()) or 1.0
     buyer_weights = {d: round(importances[d] / total_imp, 3) for d in importances}
@@ -188,13 +183,14 @@ def build_dynamic_scenario(targets: dict, title: str = "Custom agreement") -> Sc
         "limits": buyer_limits,
         "weights": buyer_weights,
     }
+    seller_weights = _counterparty_weights(counterparty)
     seller_sheet = {
         "role": "Seller",
         "description": f"You represent the counterparty in: {title}.",
-        "priority_ranking": sorted(_COUNTERPARTY_WEIGHTS, key=lambda d: -_COUNTERPARTY_WEIGHTS[d]),
-        "priorities": "Counterparty prioritises delivery time and limiting included support.",
+        "priority_ranking": sorted(seller_weights, key=lambda d: -seller_weights[d]),
+        "priorities": (counterparty or {}).get("priorities") or "Counterparty priorities inferred from context.",
         "limits": seller_limits,
-        "weights": dict(_COUNTERPARTY_WEIGHTS),
+        "weights": seller_weights,
     }
     return Scenario(
         key="custom",
@@ -204,6 +200,40 @@ def build_dynamic_scenario(targets: dict, title: str = "Custom agreement") -> Sc
         seller=seller_sheet,
         description=f"User-defined agreement: {title}.",
     )
+
+
+def _counterparty_limits(counterparty: dict | None, buyer_limits: dict) -> dict:
+    raw = (counterparty or {}).get("limits") or {}
+    seller_limits: dict = {}
+    for dim, direction in BUYER_DIRECTION.items():
+        provided = raw.get(dim) if isinstance(raw, dict) else None
+        if isinstance(provided, dict) and provided.get("target") is not None and provided.get("walk_away") is not None:
+            seller_limits[dim] = {
+                "target": _round_dim(dim, _num(provided.get("target"), buyer_limits[dim]["walk_away"])),
+                "walk_away": _round_dim(dim, _num(provided.get("walk_away"), buyer_limits[dim]["target"])),
+            }
+            continue
+
+        bt = buyer_limits[dim]["target"]
+        bw = buyer_limits[dim]["walk_away"]
+        if direction == "low":
+            seller_limits[dim] = {"target": _round_dim(dim, bw), "walk_away": _round_dim(dim, bt * 0.9)}
+        else:
+            seller_limits[dim] = {"target": _round_dim(dim, bw), "walk_away": _round_dim(dim, bt * 1.1)}
+
+    pay = raw.get("payment_terms") if isinstance(raw, dict) else None
+    target_pay = pay.get("target") if isinstance(pay, dict) and pay.get("target") in PAYMENT_ORDER else "net30"
+    seller_limits["payment_terms"] = {"acceptable": PAYMENT_ORDER, "target": target_pay}
+    return seller_limits
+
+
+def _counterparty_weights(counterparty: dict | None) -> dict[str, float]:
+    raw = (counterparty or {}).get("weights") or {}
+    weights: dict[str, float] = {}
+    for dim in DIMENSIONS:
+        weights[dim] = max(0.01, _num(raw.get(dim), _COUNTERPARTY_WEIGHTS.get(dim, 0.1)))
+    total = sum(weights.values()) or 1.0
+    return {dim: round(weights[dim] / total, 3) for dim in DIMENSIONS}
 
 
 def _round_dim(dim: str, value: float):

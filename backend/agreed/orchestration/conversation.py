@@ -170,7 +170,7 @@ class ConversationalNegotiation:
             return "No agreement was reached within the round limit."
         s = f"Agreement reached: {format_deal(deal_terms)}."
         if score:
-            s += f" Your value {score['buyer_score']}/100, counterparty {score['seller_score']}/100 (joint {score['joint_surplus']})."
+            s += f" Your value {score['buyer_score']}/100."
         return s
 
     # ── textual: free-form negotiation / deliberation ─────────────────────────

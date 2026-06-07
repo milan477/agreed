@@ -7,7 +7,7 @@ import uuid
 from typing import Any
 
 from ..agents.representation import RepresentationAgent
-from ..domain.term_sheets import build_dynamic_scenario, get_scenario
+from ..domain.term_sheets import DIMENSIONS, PAYMENT_ORDER, build_dynamic_scenario, get_scenario
 from ..integrations.connectors import learn_from_source
 from ..llm import chat_json, chat_text
 from ..observability import op
@@ -138,6 +138,11 @@ WHAT TO COLLECT:
 - negotiation: ideal/target price, walk-away (hard limit), and what matters most (priorities).
 - participation: the user's stance and the specific points to push for.
 
+MAPPING NUMBERS (important): capture EVERY number the user states into "intake" on the same turn, even while you ask a follow-up.
+- "max", "up to", "most I'd pay", "no more than", "cap", "ceiling", "hard limit" → walk_away.
+- "ideally", "target", "around", "about", "hoping", "budget" → target.
+- If the user gives both a target and a walk-away (e.g. "ideally 7000, max 9000"), record BOTH and do not ask for them again.
+
 OUTPUT — respond with ONLY a JSON object, no prose:
 {
   "reply": "your next message, in the user's voice",
@@ -148,6 +153,7 @@ OUTPUT — respond with ONLY a JSON object, no prose:
 }
 
 RULES:
+- NEVER invent, assume, estimate, or guess a price, number, budget, or any target value. If you don't have it, ASK the user for it. Only ever put a number in "intake" that the user explicitly stated.
 - Reuse the Current goal's exact title unless the user clearly switches objective; set "goal" to null when the objective is unchanged.
 - "intake" MUST merge with what's already collected (echo known values back, add new ones).
 - "ready" is true only when there is enough to set up the session — negotiation: target AND walk-away AND at least one priority; participation: a clear stance.
@@ -611,9 +617,26 @@ def _detect_register(message: str) -> str:
 def new_session_from_goal(user_id: str, goal: dict, st: UserScopedStore) -> dict:
     kind = goal.get("kind", "negotiation")
     prof_rec = next((r for r in st.list("user_profile")), None)
+    profile = prof_rec["data"] if prof_rec else {}
     account_type = (prof_rec["data"].get("account_type") if prof_rec else None) or "individual"
     if account_type == "corporation":
         kind = "negotiation"
+
+    # The chat gathered the user's targets onto the goal's `intake`. The create
+    # endpoint only forwards id/title/kind, so recover the intake (and any richer
+    # detail) from the stored profile goal here — that's what auto-fills the panel.
+    if not goal.get("intake"):
+        stored = next(
+            (g for g in profile.get("goals", []) if g.get("id") == goal.get("id")),
+            None,
+        ) or next(
+            (g for g in profile.get("goals", [])
+             if g.get("title", "").strip().lower() == goal.get("title", "").strip().lower()),
+            None,
+        )
+        if stored:
+            goal = {**stored, **{k: v for k, v in goal.items() if v}}
+
     session = create_session(user_id, {
         "title": goal["title"],
         "kind": kind,
@@ -625,7 +648,8 @@ def new_session_from_goal(user_id: str, goal: dict, st: UserScopedStore) -> dict
         "custom_agent_url": "",
         # negotiation -> structured by default; participation is a deliberation (textual)
         "interaction_mode": "textual" if kind == "participation" else "structured",
-        "targets": None,
+        "targets": infer_targets_from_context(goal["title"], goal.get("intake") or {}, profile) if kind == "negotiation" else None,
+        "intake": goal.get("intake") or {},
         "viewpoints": None,
         "parties": {
             user_id: {"role": "Buyer" if kind == "negotiation" else "Participant", "submitted": False, "label": "You"},
@@ -701,17 +725,102 @@ def set_account_type(account_type: str, st: UserScopedStore) -> dict:
     return profile
 
 
-def default_targets() -> dict:
-    """Sensible starting values the user tweaks during the probe."""
-    sc = get_scenario()
-    bl = sc.buyer["limits"]
-    return {
-        "price": {"target": bl["price"]["target"], "walk_away": bl["price"]["walk_away"], "importance": 5},
-        "delivery_weeks": {"target": bl["delivery_weeks"]["target"], "walk_away": bl["delivery_weeks"]["walk_away"], "importance": 2},
-        "warranty_months": {"target": bl["warranty_months"]["target"], "walk_away": bl["warranty_months"]["walk_away"], "importance": 4},
-        "support_hours": {"target": bl["support_hours"]["target"], "walk_away": bl["support_hours"]["walk_away"], "importance": 2},
-        "payment_terms": {"target": bl["payment_terms"]["target"], "importance": 3},
-    }
+def infer_targets_from_context(title: str, intake: dict | None, profile: dict | None = None) -> dict:
+    """Build the user's private targets from what they EXPLICITLY told the agent.
+
+    We never invent a price or any numeric target — those are gathered in chat
+    (the agent asks the user) and simply carried into the panel here so the user
+    doesn't have to re-enter them. Dimensions the user never mentioned are left
+    unset; the scenario builder fills neutral operational defaults for those, and
+    the user can still adjust everything in the targets panel.
+    """
+    intake = intake or {}
+    targets: dict = {}
+
+    price: dict = {}
+    if intake.get("target") is not None:
+        price["target"] = intake["target"]
+    if intake.get("walk_away") is not None:
+        price["walk_away"] = intake["walk_away"]
+    if price:
+        price["importance"] = 5  # they gave concrete numbers → price clearly matters
+        targets["price"] = price
+
+    for priority in intake.get("priorities") or []:
+        dim = _priority_to_dim(str(priority))
+        if dim:
+            existing = targets.setdefault(dim, {})
+            existing["importance"] = max(4, int(existing.get("importance") or 0))
+
+    return targets
+
+
+def _normalize_targets(raw: dict) -> dict:
+    targets: dict = {}
+    for dim in ("price", "delivery_weeks", "warranty_months", "support_hours"):
+        item = raw.get(dim) if isinstance(raw, dict) else None
+        if not isinstance(item, dict):
+            continue
+        out: dict = {}
+        target = _coerce_num(item.get("target"))
+        walk = _coerce_num(item.get("walk_away"))
+        if target is not None:
+            out["target"] = target
+        if walk is not None:
+            out["walk_away"] = walk
+        try:
+            out["importance"] = max(1, min(5, int(item.get("importance", 3))))
+        except (TypeError, ValueError):
+            out["importance"] = 3
+        if out:
+            targets[dim] = out
+
+    pay = raw.get("payment_terms") if isinstance(raw, dict) else None
+    if isinstance(pay, dict):
+        out = {}
+        if pay.get("target") in PAYMENT_ORDER:
+            out["target"] = pay["target"]
+        try:
+            out["importance"] = max(1, min(5, int(pay.get("importance", 3))))
+        except (TypeError, ValueError):
+            out["importance"] = 3
+        if out:
+            targets["payment_terms"] = out
+    return targets
+
+
+def _priority_to_dim(priority: str) -> str | None:
+    p = priority.lower()
+    if any(w in p for w in ("price", "cost", "budget", "cheap", "money")):
+        return "price"
+    if any(w in p for w in ("delivery", "shipping", "timeline", "deadline", "fast")):
+        return "delivery_weeks"
+    if any(w in p for w in ("warranty", "return", "guarantee", "condition", "quality", "brand", "reliab", "durab")):
+        return "warranty_months"
+    if any(w in p for w in ("support", "service", "maintenance")):
+        return "support_hours"
+    if any(w in p for w in ("payment", "terms", "cash", "financing")):
+        return "payment_terms"
+    return None
+
+
+def _counterparty_assumptions(session: dict, profile: dict) -> dict | None:
+    data = chat_json(
+        "You infer a plausible private term sheet for the counterparty agent. Return JSON only.",
+        (
+            f"Negotiation title: {session.get('title')}\n"
+            f"Counterparty label: {session.get('other_party_label') or 'counterparty'}\n"
+            f"User-side private targets: {session.get('targets')}\n"
+            f"User context: {profile.get('constraints', '')}\n"
+            f"Dimensions: {list(DIMENSIONS)}\n"
+            "Return JSON with priorities, limits, weights. limits must include each numeric dimension with "
+            "target and walk_away, plus payment_terms target. weights must include every dimension and sum roughly to 1. "
+            "Make the assumptions realistic for this specific counterparty, not generic."
+        ),
+        max_tokens=800,
+        temperature=0.5,
+    )
+    return data if isinstance(data, dict) else None
 
 
 def save_probe(
@@ -730,7 +839,11 @@ def save_probe(
     if interaction_mode in ("structured", "textual"):
         session["interaction_mode"] = interaction_mode
     if session.get("kind") == "negotiation":
-        session["targets"] = targets or session.get("targets") or default_targets()
+        prof_rec = next((r for r in st.list("user_profile")), None)
+        profile = prof_rec["data"] if prof_rec else {}
+        session["targets"] = _normalize_targets(targets or {}) or session.get("targets") or infer_targets_from_context(
+            session["title"], session.get("intake") or {}, profile
+        )
     else:
         session["viewpoints"] = viewpoints or session.get("viewpoints") or []
         session["interaction_mode"] = "textual"
@@ -759,7 +872,9 @@ def prepare_session(session_id: str, user_id: str, st: UserScopedStore) -> dict:
     brief = rep.build_brief(party, profile, self_improved=False)
     # Reflect the user's *own* probed targets into the brief so it isn't generic.
     if session.get("kind") == "negotiation" and session.get("targets"):
-        sc = build_dynamic_scenario(session["targets"], session["title"])
+        counterparty = _counterparty_assumptions(session, profile)
+        session["counterparty_assumptions"] = counterparty
+        sc = build_dynamic_scenario(session["targets"], session["title"], counterparty)
         from ..domain.term_sheets import DIM_LABELS
         ranked = sc.buyer["priority_ranking"]
         brief["ranked_priorities"] = [DIM_LABELS.get(p, p) for p in ranked]
@@ -795,7 +910,9 @@ def confirm_agent_choice(
     session["custom_agent_url"] = custom_agent_url.strip()
     session["status"] = "probe"
     if session.get("kind") == "negotiation" and not session.get("targets"):
-        session["targets"] = default_targets()
+        prof_rec = next((r for r in st.list("user_profile")), None)
+        profile = prof_rec["data"] if prof_rec else {}
+        session["targets"] = infer_targets_from_context(session["title"], session.get("intake") or {}, profile)
     return update_session(session_id, session)
 
 
@@ -830,7 +947,8 @@ def _run_session_negotiation(session: dict, st: UserScopedStore) -> dict:
     session["status"] = "running"
 
     prof_rec = next((r for r in st.list("user_profile")), None)
-    voice = (prof_rec["data"].get("voice_sample", "") if prof_rec else "")
+    profile = prof_rec["data"] if prof_rec else {}
+    voice = profile.get("voice_sample", "")
 
     kind = session.get("kind", "negotiation")
     mode = session.get("interaction_mode") or ("structured" if kind == "negotiation" else "textual")
@@ -838,7 +956,9 @@ def _run_session_negotiation(session: dict, st: UserScopedStore) -> dict:
     counter_label = session.get("other_party_label") or "Counterparty agent"
 
     if kind == "negotiation" and session.get("targets"):
-        scenario = build_dynamic_scenario(session["targets"], session["title"])
+        counterparty = session.get("counterparty_assumptions") or _counterparty_assumptions(session, profile)
+        session["counterparty_assumptions"] = counterparty
+        scenario = build_dynamic_scenario(session["targets"], session["title"], counterparty)
     else:
         scenario = get_scenario()
 

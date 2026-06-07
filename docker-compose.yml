@@ -1,0 +1,30 @@
+services:
+  api:
+    build:
+      context: ./backend
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      DATABASE_URL: ${DATABASE_URL:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8080}
+    ports:
+      - "3000:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}

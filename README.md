@@ -66,3 +66,9 @@ pnpm dev   # http://localhost:3000
 - **Strict data isolation**: row-level isolation by `user_id`, every access audited.
 
 See `backend/README.md` for architecture and the self-improvement loop.
+
+## Hackathon (WeaveHacks 4)
+
+- **Eligibility checklist:** `HACKATHON.md`
+- **Submission copy-paste:** `SUBMISSION.md`
+- **3-min demo script:** `DEMO.md`

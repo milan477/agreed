@@ -12,8 +12,8 @@ openai>=1.30
 
 # Sponsor integrations (optional; enabled automatically when keys are present).
 # Install with: pip install -e ".[full]"  — or uncomment as needed.
-# weave>=0.51
-# wandb>=0.17
+weave>=0.51
+wandb>=0.17
 # langgraph>=0.2
 # dspy-ai>=2.4
 # e2b-code-interpreter>=1.0

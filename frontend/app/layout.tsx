@@ -1,15 +1,18 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { Assistant } from "@/components/Assistant";
 
 export const metadata: Metadata = {
-  title: "agreed — better agreements, faster",
-  description: "AI agents represent humans in negotiation and reach optimal, transparent agreements.",
+  title: "Agreed. — better agreements, faster",
+  description: "Agentic representation that mathematically aligns diverse stakes into one synthesized agreement.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <Assistant>{children}</Assistant>
+      </body>
     </html>
   );
 }

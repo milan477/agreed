@@ -10,7 +10,7 @@ answers. Uses the LLM when available, else a structured template.
 from __future__ import annotations
 
 from ..domain.term_sheets import DIM_LABELS, Scenario
-from ..llm import chat_text
+from ..llm import chat_json, chat_text
 from ..observability import op
 from .base import Agent
 from .researcher import ResearcherAgent
@@ -80,17 +80,38 @@ class RepresentationAgent(Agent):
     def build_brief(self, party: str, profile: dict, *, self_improved: bool = False) -> dict:
         """Step 2.5: research + ranked priorities + walk-aways + opening + strategy."""
         term_sheet = self.scenario.term_sheet(party)
-        research = self.researcher.research(f"{self.scenario.title} {party} negotiation benchmarks")
+        # Research the user's ACTUAL goal, not the generic default scenario.
+        goal = (profile.get("purpose") or "").strip() or self.scenario.title
+        research = self.researcher.research(f"{goal} — {party} negotiation benchmarks")
+        generated = self._brief_copy(party, profile, research["findings"])
         return {
             "party": party,
             "ranked_priorities": [DIM_LABELS.get(p, p) for p in term_sheet["priority_ranking"]],
             "walk_away_points": term_sheet["limits"],
             "opening_position": {d: term_sheet["limits"][d]["target"] for d in term_sheet["limits"]},
             "research_findings": research["findings"],
-            "strategy": (
-                "Open near targets; infer the other side's priorities from their moves; "
-                "trade away what they value and you don't; hold firm on your top priorities."
-            ),
+            "research_heading": generated.get("research_heading") or "Prep notes",
+            "strategy": generated.get("strategy")
+            or "Open near targets; infer the other side's priorities from their moves; trade on lower-priority terms.",
             "self_improved": self_improved,
             "approved": False,
         }
+
+    def _brief_copy(self, party: str, profile: dict, findings: list[dict]) -> dict:
+        data = chat_json(
+            (
+                "You write concise UI copy for a user's private negotiation brief. "
+                "Return JSON only with research_heading and strategy."
+            ),
+            (
+                f"Party: {party}\n"
+                f"Purpose: {profile.get('purpose', '')}\n"
+                f"Constraints: {profile.get('constraints', '')}\n"
+                f"Findings: {findings[:4]}\n"
+                "research_heading should be 2-5 words and specific to the context, not a generic label. "
+                "strategy should be one sentence in first person from the agent's perspective."
+            ),
+            max_tokens=220,
+            temperature=0.4,
+        )
+        return data if isinstance(data, dict) else {}

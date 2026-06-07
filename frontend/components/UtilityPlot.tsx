@@ -73,23 +73,23 @@ export function UtilityPlot({
           <g>
             <defs>
               <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-                <path d="M0,0 L6,3 L0,6 Z" fill="#1f7a63" />
+                <path d="M0,0 L6,3 L0,6 Z" fill="#14532d" />
               </marker>
             </defs>
             <line
               x1={sx(baseDeal.x)} y1={sy(baseDeal.y)}
               x2={sx(impDeal.x)} y2={sy(impDeal.y)}
-              stroke="#1f7a63" strokeWidth={1.5} markerEnd="url(#arrow)"
+              stroke="#14532d" strokeWidth={1.5} markerEnd="url(#arrow)"
             />
-            <circle cx={sx(impDeal.x)} cy={sy(impDeal.y)} r={6} fill="#1f7a63" />
-            <text x={sx(impDeal.x) + 9} y={sy(impDeal.y) - 8} fontSize="10" fill="#1f7a63">improved</text>
+            <circle cx={sx(impDeal.x)} cy={sy(impDeal.y)} r={6} fill="#14532d" />
+            <text x={sx(impDeal.x) + 9} y={sy(impDeal.y) - 8} fontSize="10" fill="#14532d">improved</text>
           </g>
         )}
       </svg>
       <div className="legend">
         <span><span className="sw" style={{ background: "#c9c9c4" }} />trajectory</span>
         <span><span className="sw" style={{ background: "#6b6b66" }} />baseline deal</span>
-        {impDeal && <span><span className="sw" style={{ background: "#1f7a63" }} />after self-improvement</span>}
+        {impDeal && <span><span className="sw" style={{ background: "#14532d" }} />after self-improvement</span>}
       </div>
     </div>
   );

@@ -1,0 +1,118 @@
+substitutions:
+  _REGION: us-west1
+  _DATABASE_URL: ""
+  _OPENAI_API_KEY: ""
+  _WANDB_API_KEY: ""
+  _CORS_ORIGINS: ""
+
+steps:
+  - id: build-backend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/agreed/backend:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/agreed/backend:latest
+      - ./backend
+
+  - id: push-backend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/agreed/backend
+    waitFor: [build-backend]
+
+  - id: deploy-backend
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - agreed-api
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/agreed/backend:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --port=8080
+      - --memory=1Gi
+      - --cpu=1
+      - --min-instances=0
+      - --max-instances=10
+      - --set-env-vars=DATABASE_URL=${_DATABASE_URL},OPENAI_API_KEY=${_OPENAI_API_KEY},WANDB_API_KEY=${_WANDB_API_KEY},CORS_ORIGINS=${_CORS_ORIGINS}
+    waitFor: [push-backend]
+
+  - id: resolve-backend-url
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud run services describe agreed-api \
+          --region=${_REGION} \
+          --format='value(status.url)' > /workspace/backend_url.txt
+    waitFor: [deploy-backend]
+
+  - id: build-frontend
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        BACKEND_URL=$$(cat /workspace/backend_url.txt)
+        docker build \
+          --build-arg NEXT_PUBLIC_API_BASE=$$BACKEND_URL \
+          -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/agreed/frontend:$SHORT_SHA \
+          -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/agreed/frontend:latest \
+          ./frontend
+    waitFor: [resolve-backend-url]
+
+  - id: push-frontend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/agreed/frontend
+    waitFor: [build-frontend]
+
+  - id: deploy-frontend
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - agreed-web
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/agreed/frontend:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --port=8080
+      - --memory=512Mi
+      - --cpu=1
+      - --min-instances=0
+      - --max-instances=10
+    waitFor: [push-frontend]
+
+  - id: update-cors
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        FRONTEND_URL=$$(gcloud run services describe agreed-web \
+          --region=${_REGION} \
+          --format='value(status.url)')
+        gcloud run services update agreed-api \
+          --region=${_REGION} \
+          --update-env-vars=CORS_ORIGINS=$$FRONTEND_URL
+        echo "Frontend: $$FRONTEND_URL"
+        echo "Backend: $$(cat /workspace/backend_url.txt)"
+    waitFor: [deploy-frontend]
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/agreed/backend:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/agreed/frontend:$SHORT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY
