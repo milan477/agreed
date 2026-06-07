@@ -71,6 +71,7 @@ class Settings:
     twilio_token: str
     twilio_from: str
     cors_origins: str
+    public_base_url: str
 
     # ── capability flags (computed) ──────────────────────────────────────────
     @property
@@ -92,6 +93,10 @@ class Settings:
     @property
     def has_mem0(self) -> bool:
         return bool(self.mem0_api_key)
+
+    @property
+    def has_twilio(self) -> bool:
+        return bool(self.twilio_sid and self.twilio_token and self.twilio_from)
 
     @property
     def resolved_llm_backend(self) -> str:
@@ -126,6 +131,7 @@ def get_settings() -> Settings:
         twilio_token=_get("TWILIO_AUTH_TOKEN"),
         twilio_from=_get("TWILIO_FROM_NUMBER"),
         cors_origins=_get("CORS_ORIGINS"),
+        public_base_url=_get("PUBLIC_BASE_URL"),
     )
 
 
@@ -149,4 +155,6 @@ def capability_report() -> dict[str, object]:
         "mem0_memory": "live" if s.has_mem0 else "in-memory fallback",
         "redis": "configured" if s.redis_url else "in-memory fallback",
         "database": "postgres" if s.database_url else "sqlite fallback",
+        "twilio_sms_voice": "live" if s.has_twilio else "macOS iMessage fallback",
+        "auto_followups": "live" if s.has_twilio or s.public_base_url else "scheduled (needs phone + Twilio or macOS)",
     }

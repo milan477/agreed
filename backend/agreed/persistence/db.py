@@ -50,6 +50,12 @@ CREATE TABLE IF NOT EXISTS platform_sessions (
     updated_at   DOUBLE PRECISION
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_invite ON platform_sessions(invite_code);
+CREATE TABLE IF NOT EXISTS channel_index (
+    channel    TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL,
+    updated_at DOUBLE PRECISION
+);
+CREATE INDEX IF NOT EXISTS idx_channel_user ON channel_index(user_id);
 """
 
 POSTGRES_RLS_SQL = """

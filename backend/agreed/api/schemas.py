@@ -100,3 +100,39 @@ class ProbeIn(BaseModel):
     targets: dict[str, Any] | None = None
     viewpoints: list[dict[str, Any]] | None = None
     interaction_mode: str | None = None  # structured | textual
+
+
+class MessageDraftIn(BaseModel):
+    recipient: str = ""
+    purpose: str
+    channel: str = "text"  # text | call
+
+
+class MessageSendIn(BaseModel):
+    recipient: str
+    body: str = ""
+    channel: str = "text"  # text | call
+
+
+class TentativeIn(BaseModel):
+    text: str
+
+
+class TentativeStatusIn(BaseModel):
+    item_id: str
+    status: str  # tentative | accepted | rejected
+
+
+class ContactInfoIn(BaseModel):
+    phone: str | None = None
+    email: str | None = None
+    preferred_channel: str | None = None  # text | call | auto
+    outreach_enabled: bool | None = None
+    followup_delay_minutes: float | None = None
+
+
+class FollowupScheduleIn(BaseModel):
+    channel: str = "text"
+    purpose: str
+    delay_minutes: float = 2
+    open_question: str = ""

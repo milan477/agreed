@@ -8,7 +8,8 @@ from typing import Any
 
 from ..agents.representation import RepresentationAgent
 from ..domain.term_sheets import build_dynamic_scenario, get_scenario
-from ..llm import chat_text
+from ..integrations.connectors import learn_from_source
+from ..llm import chat_json, chat_text
 from ..observability import op
 from ..orchestration.conversation import ConversationalNegotiation
 from ..persistence.sessions import create_session, get_by_invite, get_session, parse_invite_link, update_session
@@ -24,6 +25,14 @@ def _default_profile() -> dict:
         "goals": [],
         "account_type": "individual",  # "individual" | "corporation"
         "voice_sample": "",  # last thing the user said, used to mirror their tone
+        "phone": "",
+        "email": "",
+        "preferred_channel": "text",  # text | call | auto
+        "outreach_enabled": True,
+        "followup_delay_minutes": 2,
+        "connections": [],   # connected data-source ids
+        "learned_facts": [], # facts the agent learned from connectors
+        "counterparties": [],
     }
 
 
@@ -122,7 +131,118 @@ def chat_with_agent(message: str, history: list[dict], profile: dict) -> dict:
     if len(message) > 20 and not profile.get("intent_summary"):
         profile["intent_summary"] = message[:280]
 
-    return {"reply": reply.strip(), "profile": profile, "new_goals": new_goals}
+    intent = _validate_intent(message, new_goals, goals, account_type)
+    suggested = _suggested_questions(message, profile, new_goals, account_type)
+
+    return {
+        "reply": reply.strip(),
+        "profile": profile,
+        "new_goals": new_goals,
+        "intent": intent,
+        "suggested_questions": suggested,
+    }
+
+
+def _validate_intent(message: str, new_goals: list[dict], goals: list[dict], account_type: str) -> dict:
+    """Surface a confirmable intent so the chat can validate before acting.
+
+    CopilotKit renders this as an inline confirmation card; offline we still
+    detect intent heuristically so the UX is identical.
+    """
+    if new_goals:
+        g = new_goals[-1]
+        return {
+            "detected": True,
+            "summary": g["title"],
+            "kind": g["kind"],
+            "goal_id": g["id"],
+            "confidence": 0.82,
+            "needs_confirmation": True,
+            "prompt": f"Want me to set up “{g['title']}” as a {g['kind']}?",
+        }
+    return {"detected": False}
+
+
+def _suggested_questions(message: str, profile: dict, new_goals: list[dict], account_type: str) -> list[str]:
+    """Dynamically propose the next useful things to tell the agent."""
+    if llm_available_safe():
+        sys = (
+            "You generate up to 3 very short follow-up prompts (max 7 words each) that the USER could "
+            "tap to tell their negotiation agent more. Return JSON: {\"questions\": [\"...\"]}. "
+            "Base them on what's still unknown (targets, walk-away, counterparty, deadline, priorities)."
+        )
+        usr = f"Account: {account_type}. Profile: {profile}. Latest message: {message}."
+        data = chat_json(sys, usr, max_tokens=160)
+        if data and isinstance(data.get("questions"), list):
+            qs = [str(q).strip() for q in data["questions"] if str(q).strip()][:3]
+            if qs:
+                return qs
+    have_goal = bool(profile.get("goals"))
+    constraints = profile.get("constraints", "")
+    out: list[str] = []
+    if new_goals or have_goal:
+        if "budget" not in constraints.lower() and "$" not in constraints:
+            out.append("Set my budget / walk-away")
+        out.append("Who's on the other side?")
+        out.append("What matters most to me")
+    else:
+        out = ["I want to negotiate a deal", "I want a say in a decision", "Learn about me first"]
+    return out[:3]
+
+
+def llm_available_safe() -> bool:
+    try:
+        from ..llm import llm_available
+        return llm_available()
+    except Exception:
+        return False
+
+
+def connect_source(source_id: str, st: UserScopedStore) -> dict:
+    """Link a data source; the agent learns from it and reacts personally."""
+    result = learn_from_source(source_id)
+    prof_rec = next((r for r in st.list("user_profile")), None)
+    profile = prof_rec["data"] if prof_rec else _default_profile()
+    account_type = profile.get("account_type", "individual")
+
+    conns = set(profile.get("connections", []))
+    conns.add(source_id)
+    profile["connections"] = sorted(conns)
+
+    learned = profile.get("learned_facts", [])
+    for f in result.facts:
+        learned.append({**f, "source": source_id})
+    profile["learned_facts"] = learned[-40:]
+    profile["traits"] = sorted(set(profile.get("traits", []) + result.traits))
+    profile["counterparties"] = sorted(set(profile.get("counterparties", []) + result.counterparties))
+    if result.constraints:
+        merged = (profile.get("constraints", "") + " " + "; ".join(result.constraints)).strip()
+        profile["constraints"] = merged[:400]
+    if result.tone and not profile.get("tone_hint"):
+        profile["tone_hint"] = result.tone
+
+    goals = profile.get("goals", [])
+    titles = {g["title"].lower() for g in goals}
+    new_goals: list[dict] = []
+    for g in result.suggested_goals:
+        if g["title"].lower() in titles:
+            continue
+        kind = "negotiation" if account_type == "corporation" else g.get("kind", "negotiation")
+        ng = {
+            "id": uuid.uuid4().hex[:10],
+            "title": g["title"],
+            "kind": kind,
+            "status": "open",
+            "from_connector": source_id,
+            "other_party_label": g.get("other_party_label"),
+        }
+        goals.append(ng)
+        new_goals.append(ng)
+        titles.add(g["title"].lower())
+    profile["goals"] = goals
+
+    st.put("user_profile", profile, record_id=prof_rec["id"] if prof_rec else None)
+    return {"profile": profile, "learned": result.to_dict(), "new_goals": new_goals}
 
 
 def _detect_register(message: str) -> str:
@@ -178,9 +298,43 @@ def new_session_from_goal(user_id: str, goal: dict, st: UserScopedStore) -> dict
         "goal_id": goal.get("id"),
         "negotiation_result": None,
         "brief": None,
+        "tentative_agreements": [],
     })
     st.put("session_ref", {"session_id": session["session_id"], "title": session["title"], "kind": kind}, ref=session["session_id"])
     return session
+
+
+def add_tentative_agreement(session_id: str, user_id: str, text: str, st: UserScopedStore) -> dict:
+    """Add a tentative (non-binding) point both sides can converge on."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Agreement text is required")
+    session = get_session(session_id)
+    if not session:
+        raise ValueError("Session not found")
+    items = session.setdefault("tentative_agreements", [])
+    items.append({
+        "id": uuid.uuid4().hex[:8],
+        "text": text[:280],
+        "status": "tentative",  # tentative | accepted | rejected
+        "added_by": user_id,
+    })
+    return update_session(session_id, session)
+
+
+def set_tentative_status(session_id: str, item_id: str, status: str, st: UserScopedStore) -> dict:
+    if status not in ("tentative", "accepted", "rejected"):
+        raise ValueError("Invalid status")
+    session = get_session(session_id)
+    if not session:
+        raise ValueError("Session not found")
+    for it in session.get("tentative_agreements", []):
+        if it["id"] == item_id:
+            it["status"] = status
+            break
+    else:
+        raise ValueError("Tentative agreement not found")
+    return update_session(session_id, session)
 
 
 def join_via_invite(user_id: str, invite_input: str, st: UserScopedStore) -> dict:
@@ -385,3 +539,37 @@ def list_user_sessions(st: UserScopedStore) -> list[dict]:
 
 def list_contacts(st: UserScopedStore) -> list[dict]:
     return [r["data"] for r in st.list("contact")]
+
+
+def update_contact_info(
+    st: UserScopedStore,
+    *,
+    phone: str | None = None,
+    email: str | None = None,
+    preferred_channel: str | None = None,
+    outreach_enabled: bool | None = None,
+    followup_delay_minutes: float | None = None,
+) -> dict:
+    """Save reach-out preferences and bind phone for inbound SMS/voice."""
+    from ..messaging.phone_registry import bind_phone
+
+    prof_rec = next((r for r in st.list("user_profile")), None)
+    profile = prof_rec["data"] if prof_rec else _default_profile()
+
+    if phone is not None:
+        profile["phone"] = phone.strip()
+        bound = bind_phone(st.user_id, profile["phone"])
+        if bound:
+            profile["phone"] = bound
+    if email is not None:
+        profile["email"] = email.strip()
+    if preferred_channel is not None:
+        ch = preferred_channel if preferred_channel in ("text", "call", "auto") else "text"
+        profile["preferred_channel"] = ch
+    if outreach_enabled is not None:
+        profile["outreach_enabled"] = outreach_enabled
+    if followup_delay_minutes is not None:
+        profile["followup_delay_minutes"] = max(0.5, float(followup_delay_minutes))
+
+    st.put("user_profile", profile, record_id=prof_rec["id"] if prof_rec else None)
+    return profile

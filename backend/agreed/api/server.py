@@ -6,9 +6,11 @@ to that user via `UserScopedStore`, so isolation holds regardless of the caller.
 
 from __future__ import annotations
 
+import threading
+import time
 import uuid
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from ..agents.negotiator import StrategyParams
@@ -23,8 +25,10 @@ from ..orchestration.graph import NegotiationOrchestrator
 from ..persistence.store import UserScopedStore, ensure_user, init_db
 from .chat_service import (
     _default_profile,
+    add_tentative_agreement,
     chat_with_agent,
     confirm_agent_choice,
+    connect_source,
     join_via_invite,
     list_contacts,
     list_user_sessions,
@@ -32,8 +36,14 @@ from .chat_service import (
     prepare_session,
     save_probe,
     set_account_type,
+    set_tentative_status,
     submit_agent,
+    update_contact_info,
 )
+from ..integrations.connectors import list_connectors
+from ..messaging.channel_router import handle_inbound_sms, voice_twiml
+from ..messaging.followups import list_followups, maybe_schedule_followup, process_all_due_followups, schedule_followup
+from ..messaging.outreach import draft_outbound, send_text, start_outbound_call
 from .schemas import (
     AccountTypeIn,
     AgentChoiceIn,
@@ -41,7 +51,11 @@ from .schemas import (
     BriefIn,
     ChatIn,
     ContactIn,
+    ContactInfoIn,
+    FollowupScheduleIn,
     JoinInviteIn,
+    MessageDraftIn,
+    MessageSendIn,
     NegotiationIn,
     OnboardingIn,
     ProbeIn,
@@ -50,6 +64,8 @@ from .schemas import (
     SessionUpdateIn,
     SignIn,
     StrategyIn,
+    TentativeIn,
+    TentativeStatusIn,
     UserIn,
 )
 from ..persistence.sessions import get_session, update_session
@@ -68,6 +84,16 @@ app.add_middleware(
 def _startup() -> None:
     init_db()
     init_observability()
+
+    def _followup_worker() -> None:
+        while True:
+            time.sleep(60)
+            try:
+                process_all_due_followups()
+            except Exception:
+                pass
+
+    threading.Thread(target=_followup_worker, daemon=True).start()
 
 
 def current_user(x_user_id: str | None = Header(default=None)) -> str:
@@ -243,6 +269,7 @@ def home(user_id: str = Depends(current_user), st: UserScopedStore = Depends(sto
         "goals": goals,
         "sessions": sessions,
         "contacts": list_contacts(st),
+        "followups": list_followups(st),
     }
 
 
@@ -258,7 +285,8 @@ def chat(body: ChatIn, st: UserScopedStore = Depends(store)) -> dict:
     cid = chat_rec["id"] if chat_rec else None
     st.put("user_profile", result["profile"], record_id=pid)
     st.put("chat_history", history, record_id=cid)
-    return result
+    followup = maybe_schedule_followup(st, result["profile"], result)
+    return {**result, "followup_scheduled": followup}
 
 
 @app.post("/api/invitations/join")
@@ -358,6 +386,139 @@ def session_prepare(session_id: str, user_id: str = Depends(current_user), st: U
 def account_type(body: AccountTypeIn, st: UserScopedStore = Depends(store)) -> dict:
     profile = set_account_type(body.account_type, st)
     return {"profile": profile}
+
+
+# ── connectors: the agent learns about the user ───────────────────────────────
+@app.get("/api/connectors")
+def connectors(st: UserScopedStore = Depends(store)) -> dict:
+    prof_rec = next((r for r in st.list("user_profile")), None)
+    connected = (prof_rec["data"].get("connections", []) if prof_rec else [])
+    return {"connectors": list_connectors(), "connected": connected}
+
+
+@app.post("/api/connectors/{source_id}/connect")
+def connect_connector(source_id: str, st: UserScopedStore = Depends(store)) -> dict:
+    try:
+        return connect_source(source_id, st)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ── messaging: the agent texts / calls on the user's behalf ───────────────────
+@app.patch("/api/profile/contact")
+def profile_contact(body: ContactInfoIn, st: UserScopedStore = Depends(store)) -> dict:
+    profile = update_contact_info(
+        st,
+        phone=body.phone,
+        email=body.email,
+        preferred_channel=body.preferred_channel,
+        outreach_enabled=body.outreach_enabled,
+        followup_delay_minutes=body.followup_delay_minutes,
+    )
+    return {"profile": profile}
+
+
+@app.get("/api/followups")
+def followups(st: UserScopedStore = Depends(store)) -> dict:
+    return {"followups": list_followups(st)}
+
+
+@app.post("/api/followups/schedule")
+def followup_schedule(body: FollowupScheduleIn, st: UserScopedStore = Depends(store)) -> dict:
+    item = schedule_followup(
+        st,
+        channel=body.channel,
+        purpose=body.purpose,
+        delay_minutes=body.delay_minutes,
+        open_question=body.open_question or body.purpose,
+    )
+    return {"followup": item}
+
+
+@app.post("/api/followups/process")
+def followup_process(st: UserScopedStore = Depends(store)) -> dict:
+    prof_rec = next((r for r in st.list("user_profile")), None)
+    profile = prof_rec["data"] if prof_rec else _default_profile()
+    from ..messaging.followups import process_user_followups
+
+    sent = process_user_followups(st, profile)
+    return {"sent": sent}
+
+
+@app.post("/api/message/draft")
+def message_draft(body: MessageDraftIn, st: UserScopedStore = Depends(store)) -> dict:
+    prof_rec = next((r for r in st.list("user_profile")), None)
+    voice = (prof_rec["data"].get("voice_sample", "") if prof_rec else "")
+    text = draft_outbound(body.recipient, body.purpose, voice_sample=voice, channel=body.channel)
+    return {"draft": text}
+
+
+@app.post("/api/message/send")
+def message_send(body: MessageSendIn, user_id: str = Depends(current_user), st: UserScopedStore = Depends(store)) -> dict:
+    prof_rec = next((r for r in st.list("user_profile")), None)
+    voice = prof_rec["data"].get("voice_sample", "") if prof_rec else ""
+    if body.channel == "call":
+        return start_outbound_call(body.recipient, user_id, purpose=body.body or "Quick check-in from your agreed agent.")
+    return send_text(body.recipient, body.body, voice_sample=voice)
+
+
+# ── Twilio webhooks (inbound SMS + voice) ─────────────────────────────────────
+@app.post("/webhooks/twilio/sms")
+async def twilio_sms_webhook(
+    From: str = Form(default=""),
+    Body: str = Form(default=""),
+) -> Response:
+    reply = handle_inbound_sms(From, Body)
+    try:
+        from twilio.twiml.messaging_response import MessagingResponse
+
+        resp = MessagingResponse()
+        resp.message(reply)
+        return Response(content=str(resp), media_type="application/xml")
+    except Exception:
+        return Response(content=reply, media_type="text/plain")
+
+
+@app.post("/webhooks/twilio/voice")
+def twilio_voice_webhook(
+    user_id: str = Query(default=""),
+    purpose: str = Query(default=""),
+) -> Response:
+    if not user_id:
+        twiml = """<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, this line is not configured.</Say></Response>"""
+        return Response(content=twiml, media_type="application/xml")
+    return Response(content=voice_twiml(user_id, purpose=purpose), media_type="application/xml")
+
+
+@app.post("/webhooks/twilio/voice/gather")
+def twilio_voice_gather(
+    user_id: str = Query(default=""),
+    SpeechResult: str = Form(default=""),
+    purpose: str = Query(default=""),
+) -> Response:
+    if not user_id:
+        twiml = """<?xml version="1.0" encoding="UTF-8"?><Response><Say>Goodbye.</Say></Response>"""
+        return Response(content=twiml, media_type="application/xml")
+    return Response(content=voice_twiml(user_id, purpose=purpose, speech=SpeechResult), media_type="application/xml")
+
+
+# ── tentative agreements ──────────────────────────────────────────────────────
+@app.post("/api/sessions/{session_id}/tentative")
+def add_tentative(session_id: str, body: TentativeIn, user_id: str = Depends(current_user), st: UserScopedStore = Depends(store)) -> dict:
+    try:
+        session = add_tentative_agreement(session_id, user_id, body.text, st)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"session": session}
+
+
+@app.patch("/api/sessions/{session_id}/tentative")
+def update_tentative(session_id: str, body: TentativeStatusIn, st: UserScopedStore = Depends(store)) -> dict:
+    try:
+        session = set_tentative_status(session_id, body.item_id, body.status, st)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"session": session}
 
 
 @app.post("/api/sessions/{session_id}/submit")
