@@ -297,7 +297,8 @@ def _apply_llm_turn(
 
     new_goals = [g2 for g2 in goals if g2["id"] not in old_ids]
     reply = str(data.get("reply") or "")
-    ready = bool(data.get("ready"))
+    # Trust the LLM, but never get stuck: if we objectively have enough, offer setup.
+    ready = bool(data.get("ready")) or _is_ready(active)
     suggested = [str(s).strip() for s in (data.get("suggested") or []) if str(s).strip()][:3]
     if not suggested:
         suggested = _suggested_questions(active, account_type)
