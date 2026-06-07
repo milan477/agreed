@@ -3,33 +3,14 @@
 from __future__ import annotations
 
 import json
-import sqlite3
-import threading
 import time
 import uuid
-from pathlib import Path
 
-from .store import _conn, init_db
-
-_lock = threading.Lock()
-
-SESSIONS_DDL = """
-CREATE TABLE IF NOT EXISTS platform_sessions (
-    session_id   TEXT PRIMARY KEY,
-    invite_code  TEXT UNIQUE NOT NULL,
-    host_user_id TEXT NOT NULL,
-    data         TEXT NOT NULL,
-    created_at   REAL,
-    updated_at   REAL
-);
-CREATE INDEX IF NOT EXISTS idx_sessions_invite ON platform_sessions(invite_code);
-"""
+from .db import _adapt_sql, _conn, _lock, init_db
 
 
 def init_sessions() -> None:
     init_db()
-    with _lock, _conn() as conn:
-        conn.executescript(SESSIONS_DDL)
 
 
 def _now() -> float:
@@ -44,8 +25,10 @@ def create_session(host_user_id: str, data: dict) -> dict:
     now = _now()
     with _lock, _conn() as conn:
         conn.execute(
-            "INSERT INTO platform_sessions(session_id, invite_code, host_user_id, data, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?)",
+            _adapt_sql(
+                "INSERT INTO platform_sessions(session_id, invite_code, host_user_id, data, created_at, updated_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s)"
+            ),
             (sid, code, host_user_id, json.dumps(data), now, now),
         )
     return data
@@ -55,7 +38,8 @@ def get_session(session_id: str) -> dict | None:
     init_sessions()
     with _lock, _conn() as conn:
         row = conn.execute(
-            "SELECT data FROM platform_sessions WHERE session_id=?", (session_id,)
+            _adapt_sql("SELECT data FROM platform_sessions WHERE session_id=%s"),
+            (session_id,),
         ).fetchone()
     return json.loads(row["data"]) if row else None
 
@@ -64,7 +48,8 @@ def get_by_invite(invite_code: str) -> dict | None:
     init_sessions()
     with _lock, _conn() as conn:
         row = conn.execute(
-            "SELECT data FROM platform_sessions WHERE invite_code=?", (invite_code.strip(),)
+            _adapt_sql("SELECT data FROM platform_sessions WHERE invite_code=%s"),
+            (invite_code.strip(),),
         ).fetchone()
     return json.loads(row["data"]) if row else None
 
@@ -74,7 +59,7 @@ def update_session(session_id: str, data: dict) -> dict:
     now = _now()
     with _lock, _conn() as conn:
         conn.execute(
-            "UPDATE platform_sessions SET data=?, updated_at=? WHERE session_id=?",
+            _adapt_sql("UPDATE platform_sessions SET data=%s, updated_at=%s WHERE session_id=%s"),
             (json.dumps(data), now, session_id),
         )
     return data

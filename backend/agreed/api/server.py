@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from ..agents.negotiator import StrategyParams
 from ..agents.representation import RepresentationAgent
 from ..agents.self_improve import SelfImprovementAgent
-from ..config import capability_report
+from ..config import capability_report, cors_origin_list
 from ..domain.frameworks import FRAMEWORKS
 from ..domain.term_sheets import DIM_LABELS, get_scenario
 from ..evals.evaluations import run_eval_suite
@@ -24,13 +24,19 @@ from ..persistence.store import UserScopedStore, ensure_user, init_db
 from .chat_service import (
     _default_profile,
     chat_with_agent,
+    confirm_agent_choice,
     join_via_invite,
     list_contacts,
     list_user_sessions,
     new_session_from_goal,
+    prepare_session,
+    save_probe,
+    set_account_type,
     submit_agent,
 )
 from .schemas import (
+    AccountTypeIn,
+    AgentChoiceIn,
     ApproveIn,
     BriefIn,
     ChatIn,
@@ -38,6 +44,7 @@ from .schemas import (
     JoinInviteIn,
     NegotiationIn,
     OnboardingIn,
+    ProbeIn,
     SelfImproveIn,
     SessionCreateIn,
     SessionUpdateIn,
@@ -51,7 +58,7 @@ from .summary import summarize_trace
 app = FastAPI(title="agreed", description="better agreements, faster", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origin_list(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -293,6 +300,64 @@ def patch_session(session_id: str, body: SessionUpdateIn, st: UserScopedStore = 
         st.put("contact", {"user_id": body.other_party_id, "label": body.other_party_label})
     session = update_session(session_id, session)
     return {"session": session}
+
+
+@app.post("/api/sessions/{session_id}/agent-choice")
+def session_agent_choice(
+    session_id: str,
+    body: AgentChoiceIn,
+    user_id: str = Depends(current_user),
+    st: UserScopedStore = Depends(store),
+) -> dict:
+    """Choose platform vs external agent, then automatically run preparation."""
+    try:
+        session = confirm_agent_choice(
+            session_id,
+            user_id,
+            st,
+            use_custom_agent=body.use_custom_agent,
+            custom_agent_url=body.custom_agent_url,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"session": session}
+
+
+@app.post("/api/sessions/{session_id}/probe")
+def session_probe(
+    session_id: str,
+    body: ProbeIn,
+    user_id: str = Depends(current_user),
+    st: UserScopedStore = Depends(store),
+) -> dict:
+    """Save the targets/viewpoints the agent probed for, then build the brief."""
+    try:
+        session = save_probe(
+            session_id,
+            user_id,
+            st,
+            targets=body.targets,
+            viewpoints=body.viewpoints,
+            interaction_mode=body.interaction_mode,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"session": session}
+
+
+@app.post("/api/sessions/{session_id}/prepare")
+def session_prepare(session_id: str, user_id: str = Depends(current_user), st: UserScopedStore = Depends(store)) -> dict:
+    try:
+        session = prepare_session(session_id, user_id, st)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"session": session}
+
+
+@app.post("/api/account-type")
+def account_type(body: AccountTypeIn, st: UserScopedStore = Depends(store)) -> dict:
+    profile = set_account_type(body.account_type, st)
+    return {"profile": profile}
 
 
 @app.post("/api/sessions/{session_id}/submit")

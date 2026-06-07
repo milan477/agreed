@@ -85,3 +85,18 @@ class SessionUpdateIn(BaseModel):
 class ContactIn(BaseModel):
     user_id: str
     label: str
+
+
+class AgentChoiceIn(BaseModel):
+    use_custom_agent: bool = False
+    custom_agent_url: str = ""
+
+
+class AccountTypeIn(BaseModel):
+    account_type: str = "individual"  # individual | corporation
+
+
+class ProbeIn(BaseModel):
+    targets: dict[str, Any] | None = None
+    viewpoints: list[dict[str, Any]] | None = None
+    interaction_mode: str | None = None  # structured | textual

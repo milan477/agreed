@@ -70,6 +70,7 @@ class Settings:
     twilio_sid: str
     twilio_token: str
     twilio_from: str
+    cors_origins: str
 
     # ── capability flags (computed) ──────────────────────────────────────────
     @property
@@ -124,7 +125,15 @@ def get_settings() -> Settings:
         twilio_sid=_get("TWILIO_ACCOUNT_SID"),
         twilio_token=_get("TWILIO_AUTH_TOKEN"),
         twilio_from=_get("TWILIO_FROM_NUMBER"),
+        cors_origins=_get("CORS_ORIGINS"),
     )
+
+
+def cors_origin_list() -> list[str]:
+    raw = get_settings().cors_origins
+    if not raw:
+        return ["*"]
+    return [o.strip() for o in raw.split(",") if o.strip()]
 
 
 def capability_report() -> dict[str, object]:
